@@ -97,12 +97,13 @@ class LocalProxyServer {
         val rawIn = app.getInputStream() // 未缓冲，保证嗅探不丢字节
         val appOut = BufferedOutputStream(app.getOutputStream(), 64 * 1024)
 
-        // 1. 读取 DEST 前导行
+        // 1. 读取 DEST 前导行（DEST <ip> <port> [uid]）
         val destLine = readLineRaw(rawIn) ?: return
         if (!destLine.startsWith("DEST ")) return
         val parts = destLine.split(" ")
         val destIp = parts.getOrNull(1) ?: return
         val destPort = parts.getOrNull(2)?.toIntOrNull() ?: return
+        val uid = parts.getOrNull(3)?.toIntOrNull() ?: -1
 
         // 2. 嗅探首字节分流
         val first = rawIn.read()
@@ -118,7 +119,7 @@ class LocalProxyServer {
             readFully(rawIn, body)
             val record = byteArrayOf(first.toByte()) + headerRest + body
             val sni = SniParser.extract(record)
-            handleTls(app, record, appOut, destIp, destPort, sni)
+            handleTls(app, record, appOut, destIp, destPort, sni, uid)
         } else {
             // 读一行判断 HTTP method
             val lineBytes = ByteArrayOutputStream()
@@ -133,7 +134,7 @@ class LocalProxyServer {
             val method = line.substringBefore(' ').uppercase()
             val stream = BufferedInputStream(SequenceInputStream(ByteArrayInputStream(prefix), rawIn), 64 * 1024)
             if (method in HTTP_METHODS) {
-                handlePlainHttp(app, stream, appOut, destIp, destPort)
+                handlePlainHttp(app, stream, appOut, destIp, destPort, uid)
             } else {
                 blindRelay(app, stream, appOut, destIp, destPort)
             }
@@ -142,7 +143,7 @@ class LocalProxyServer {
 
     // ---------- 明文 HTTP ----------
 
-    private fun handlePlainHttp(app: Socket, appIn: BufferedInputStream, appOut: BufferedOutputStream, destIp: String, destPort: Int) {
+    private fun handlePlainHttp(app: Socket, appIn: BufferedInputStream, appOut: BufferedOutputStream, destIp: String, destPort: Int, uid: Int) {
         val head = HttpCodec.readHead(appIn) ?: return
         val startParts = head.startLine.split(" ")
         if (startParts.size < 2) return
@@ -154,6 +155,7 @@ class LocalProxyServer {
 
         val exchange = HttpExchange(scheme = "http", host = host, port = destPort, isTls = false)
         exchange.remoteIp = destIp
+        exchange.uid = uid
         exchange.method = method
         exchange.path = normalizePath(startParts[1])
         exchange.requestHeaders = head.headers.toList()
@@ -193,7 +195,7 @@ class LocalProxyServer {
 
     private fun handleTls(
         app: Socket, clientHello: ByteArray, appOut: BufferedOutputStream,
-        destIp: String, destPort: Int, sni: String?
+        destIp: String, destPort: Int, sni: String?, uid: Int
     ) {
         val host = sni ?: destIp
         // 该 host 此前 MITM 失败过 → 直接透传，保证 App 可用
@@ -253,6 +255,7 @@ class LocalProxyServer {
 
             val exchange = HttpExchange(scheme = "https", host = hostHeader ?: host, port = destPort, isTls = true)
             exchange.remoteIp = destIp
+            exchange.uid = uid
             exchange.method = method
             exchange.path = normalizePath(startParts[1])
             exchange.requestHeaders = head.headers.toList()

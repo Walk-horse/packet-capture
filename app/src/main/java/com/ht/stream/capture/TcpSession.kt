@@ -24,13 +24,14 @@ class TcpSession(
     private val remoteIp: ByteArray,   // 原始目标
     private val remotePort: Int,
     private val proxyPort: Int,
+    private val uid: Int,              // 发起连接的应用 uid（-1 未知）
     private val writeToTun: (ByteArray) -> Unit,
     private val onClose: (String) -> Unit
 ) {
     companion object {
         private const val TAG = "TcpSession"
         private const val MAX_PAYLOAD = 1400
-        private const val PROXY_DEST_LINE = "DEST %s %d\n"
+        private const val PROXY_DEST_LINE = "DEST %s %d %d\n" // ip port uid
     }
 
     private val closed = AtomicBoolean(false)
@@ -113,7 +114,7 @@ class TcpSession(
             socket.keepAlive = true
             socket.connect(InetSocketAddress("127.0.0.1", proxyPort), 5000)
             // 把原始目标告知代理
-            val prelude = PROXY_DEST_LINE.format(Packet.ipToString(remoteIp), remotePort)
+            val prelude = PROXY_DEST_LINE.format(Packet.ipToString(remoteIp), remotePort, uid)
                 .toByteArray(Charsets.US_ASCII)
             socket.getOutputStream().write(prelude)
             socket.getOutputStream().flush()

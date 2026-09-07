@@ -35,6 +35,9 @@ class HttpExchange(
     /** 实际连接的远端 IP */
     var remoteIp: String? = null
 
+    /** 发起请求的应用进程 uid（-1 表示未能解析） */
+    var uid: Int = -1
+
     val startTime: Long = System.currentTimeMillis()
     var endTime: Long = 0
 

@@ -161,6 +161,7 @@ class CaptureVpnService : VpnService() {
                         appIp = ip.src, appPort = tcp.srcPort,
                         remoteIp = ip.dst, remotePort = tcp.dstPort,
                         proxyPort = proxyServer.port,
+                        uid = UidResolver.uidOf(tcp.srcPort),
                         writeToTun = { writeToTun(it) },
                         onClose = { tcpSessions.remove(it) }
                     )

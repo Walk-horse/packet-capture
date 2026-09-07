@@ -12,6 +12,49 @@ import java.util.Locale
 import java.util.zip.GZIPInputStream
 import java.util.zip.InflaterInputStream
 
+/** 资源类型分类（仿 DevTools Network 面板） */
+enum class ReqType(val label: String) {
+    ALL("全部"),
+    XHR("Fetch/XHR"),
+    DOC("文档"),
+    CSS("CSS"),
+    JS("JS"),
+    IMG("图片"),
+    WASM("Wasm"),
+    OTHER("其他");
+
+    companion object {
+        /** 筛选 chips 顺序（不含 ALL 之外的额外逻辑） */
+        val filters = entries.toList()
+    }
+}
+
+/**
+ * 按 Content-Type（响应优先）归类资源类型，缺失/不明确时按 path 扩展名兜底。
+ * 抓包层无法感知页面发起类型（fetch/xhr/document），JSON/XML/表单等 API 响应归为 Fetch/XHR。
+ */
+fun classifyType(e: HttpExchange): ReqType {
+    val ct = (e.responseContentType ?: e.requestContentType ?: "")
+        .lowercase().substringBefore(';').trim()
+    val base = e.path.substringBefore('?').lowercase()
+    fun hasExt(vararg s: String) = s.any { base.endsWith(it) }
+    return when {
+        ct.startsWith("image/") -> ReqType.IMG
+        ct.startsWith("application/wasm") -> ReqType.WASM
+        ct == "text/css" -> ReqType.CSS
+        ct.contains("javascript") || ct.contains("ecmascript") || ct.contains("x-javascript") -> ReqType.JS
+        ct.contains("html") || ct == "application/xhtml+xml" -> ReqType.DOC
+        ct.contains("json") || ct.contains("xml") || ct.contains("x-www-form-urlencoded") ||
+            ct.contains("multipart/form-data") -> ReqType.XHR
+        hasExt(".css") -> ReqType.CSS
+        hasExt(".js", ".mjs", ".cjs") -> ReqType.JS
+        hasExt(".html", ".htm") -> ReqType.DOC
+        hasExt(".wasm") -> ReqType.WASM
+        hasExt(".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp", ".avif", ".heic", ".webp") -> ReqType.IMG
+        else -> ReqType.OTHER
+    }
+}
+
 fun formatSize(n: Int): String = when {
     n < 1024 -> "${n}B"
     n < 1024 * 1024 -> "%.1fK".format(n / 1024.0)
@@ -35,6 +78,22 @@ private fun iso8601(ms: Long): String =
     SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ", Locale.US).format(Date(ms))
 
 fun formatDuration(ms: Long): String = if (ms < 0) "…" else "${ms}ms"
+
+/**
+ * 将文本转为「任意位置可换行」：在每个字符之间插入零宽空格 U+200B。
+ * 零宽空格不占宽度、不影响显示，仅为排版引擎提供任意断行点，
+ * 使超长 token（URL/query/无空格长串）也能在任意字符处折行。
+ * 注意：该零宽字符会保留在复制出来的文本中（不可见），仅用于展示型文本。
+ */
+fun breakAnywhere(s: String): String {
+    if (s.isEmpty()) return s
+    val sb = StringBuilder(s.length * 2)
+    for ((i, c) in s.withIndex()) {
+        if (i > 0) sb.append('\u200B')
+        sb.append(c)
+    }
+    return sb.toString()
+}
 
 /** 尝试按文本解码 body（支持 gzip/deflate/brotli/zstd），失败/二进制返回描述性提示 */
 fun decodeBodyPreview(e: HttpExchange, request: Boolean, limit: Int = Int.MAX_VALUE): String? {

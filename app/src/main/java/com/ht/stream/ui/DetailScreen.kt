@@ -252,7 +252,7 @@ private fun TimeTab(e: HttpExchange) {
 private fun MessageTab(e: HttpExchange, request: Boolean, searchable: Boolean = false) {
     val headers = if (request) e.requestHeaders else e.responseHeaders
     val startLine = if (request) {
-        "${e.method} ${e.path.ifEmpty { "/" }} HTTP/1.1"
+        "${e.method} ${breakAnywhere(e.path.ifEmpty { "/" })} HTTP/1.1"
     } else {
         if (e.statusCode > 0) "HTTP/1.1 ${e.statusCode} ${e.statusText}" else "（尚无响应）"
     }
