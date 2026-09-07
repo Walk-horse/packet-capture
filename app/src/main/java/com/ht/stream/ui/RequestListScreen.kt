@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
@@ -25,6 +26,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -54,6 +56,9 @@ fun RequestListScreen(
     var tab by remember { mutableIntStateOf(0) }
     var searchOn by remember { mutableStateOf(false) }
     var filter by remember { mutableStateOf("") }
+    val listState = rememberLazyListState()
+    // 切换 全部请求/按域名 时回到顶部
+    LaunchedEffect(tab) { listState.scrollToItem(0) }
 
     val base = remember(all, sessionId) {
         if (sessionId == null) all else all.filter { it.sessionId == sessionId }
@@ -111,6 +116,7 @@ fun RequestListScreen(
 
         LazyColumn(
             Modifier.fillMaxSize().background(Color.White),
+            state = listState,
             contentPadding = PaddingValues(bottom = 16.dp)
         ) {
             if (tab == 0) {

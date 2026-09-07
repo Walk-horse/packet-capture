@@ -120,7 +120,9 @@ private fun Md5Tool() {
 private fun TimestampTool() {
     var input by remember { mutableStateOf("") }
     var output by remember { mutableStateOf("") }
-    val fmt = remember { SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault()) }
+    // 展示/解析主格式不带毫秒；毫秒输入做兜底，未填时毫秒默认为 0
+    val fmt = remember { SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()) }
+    val fmtMs = remember { SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault()) }
     ToolInput(input, hint = "时间戳(秒/毫秒) 或 yyyy-MM-dd HH:mm:ss") { input = it }
     RowButtons(listOf(
         "转日期" to {
@@ -132,13 +134,15 @@ private fun TimestampTool() {
         },
         "转时间戳" to {
             output = runCatching {
-                val d = fmt.parse(input.trim()) ?: throw IllegalArgumentException("无法解析日期")
+                val d = fmt.parse(input.trim())
+                    ?: fmtMs.parse(input.trim())
+                    ?: throw IllegalArgumentException("无法解析日期")
                 "${d.time}（毫秒）\n${d.time / 1000}（秒）"
             }.getOrElse { "失败：${it.message}" }
         },
         "当前时间" to {
             val now = System.currentTimeMillis()
-            output = "${fmt.format(Date(now))}\n$now（毫秒）"
+            output = "${fmt.format(Date(now))}\n$now（毫秒）\n${now / 1000}（秒）"
         }
     ))
     ToolOutput(output)
