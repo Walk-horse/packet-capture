@@ -1,8 +1,11 @@
 package com.ht.stream.ui
 
 import com.ht.stream.data.HttpExchange
+import android.util.JsonReader
+import android.util.JsonToken
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.StringReader
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -34,7 +37,7 @@ private fun iso8601(ms: Long): String =
 fun formatDuration(ms: Long): String = if (ms < 0) "…" else "${ms}ms"
 
 /** 尝试按文本解码 body（支持 gzip/deflate/brotli/zstd），失败/二进制返回描述性提示 */
-fun decodeBodyPreview(e: HttpExchange, request: Boolean, limit: Int = 64 * 1024): String? {
+fun decodeBodyPreview(e: HttpExchange, request: Boolean, limit: Int = Int.MAX_VALUE): String? {
     val raw = if (request) e.requestBody else e.responseBody
     if (raw.isEmpty()) return ""
     val headers = if (request) e.requestHeaders else e.responseHeaders
@@ -118,10 +121,10 @@ private const val MAX_DECOMPRESS = 32L * 1024 * 1024
 /**
  * body 字节转展示文本：
  *  - 空 → ""
- *  - 符合文本特征 → UTF-8 解码（含截断标注）
+ *  - 符合文本特征 → UTF-8 解码（默认不截断）
  *  - 否则（魔数命中 / NUL 字节 / 明确非文本 Content-Type）→ null（二进制）
  */
-fun bodyToText(bytes: ByteArray, contentType: String?, limit: Int = 64 * 1024): String? {
+fun bodyToText(bytes: ByteArray, contentType: String?, limit: Int = Int.MAX_VALUE): String? {
     if (bytes.isEmpty()) return ""
     val ct = contentType?.lowercase() ?: ""
     val textualHint = ct.isEmpty() || ct.startsWith("text") ||
@@ -136,7 +139,7 @@ fun bodyToText(bytes: ByteArray, contentType: String?, limit: Int = 64 * 1024): 
 }
 
 /** UTF-16 解码查看（自动处理 BOM / 大小端） */
-fun utf16Text(bytes: ByteArray, limit: Int = 64 * 1024): String {
+fun utf16Text(bytes: ByteArray, limit: Int = Int.MAX_VALUE): String {
     if (bytes.isEmpty()) return ""
     fun cap(s: String) = if (s.length > limit) s.substring(0, limit) + "\n\n…[截断，共 ${formatSize(bytes.size)}]" else s
     val withBom = String(bytes, Charsets.UTF_16)
@@ -151,7 +154,7 @@ fun utf16Text(bytes: ByteArray, limit: Int = 64 * 1024): String {
 }
 
 /** HEX dump：地址 + 十六进制 + ASCII */
-fun hexDump(bytes: ByteArray, maxBytes: Int = 48 * 1024): String {
+fun hexDump(bytes: ByteArray, maxBytes: Int = Int.MAX_VALUE): String {
     if (bytes.isEmpty()) return ""
     val n = minOf(bytes.size, maxBytes)
     val sb = StringBuilder(n * 4 + 64)
@@ -176,20 +179,86 @@ fun hexDump(bytes: ByteArray, maxBytes: Int = 48 * 1024): String {
     return sb.toString()
 }
 
-/** 若文本是 JSON 则美化（缩进 2），否则原样返回 */
+/**
+ * 若文本是 JSON 则美化（缩进 2），否则原样返回。
+ * 用流式 JsonReader 实现：不整块构建内存模型，超大 JSON（MB 级）也能快速出缩进，
+ * 字符串值不做额外转义，避免 org.json 大文本解析慢/失败后静默回退原样的问题。
+ */
 fun prettyJsonIfPossible(text: String?): String? {
     if (text.isNullOrBlank()) return text
     val t = text.trim()
     if (!t.startsWith("{") && !t.startsWith("[")) return text
     return try {
-        when (t[0]) {
-            '{' -> org.json.JSONObject(t).toString(2)
-            '[' -> org.json.JSONArray(t).toString(2)
-            else -> text
-        }
+        val sb = StringBuilder(t.length + 64)
+        prettyJsonInto(JsonReader(StringReader(t)), sb, 0)
+        sb.toString()
     } catch (_: Exception) {
         text
     }
+}
+
+private const val MAX_PRETTY_DEPTH = 256
+
+private fun prettyJsonInto(r: JsonReader, sb: StringBuilder, depth: Int) {
+    if (depth > MAX_PRETTY_DEPTH) throw IllegalArgumentException("json too deep")
+    when (r.peek()) {
+        JsonToken.BEGIN_OBJECT -> {
+            r.beginObject()
+            sb.append('{')
+            var first = true
+            while (r.hasNext()) {
+                if (!first) sb.append(',')
+                first = false
+                sb.append('\n')
+                repeat(depth + 1) { sb.append("  ") }
+                sb.append(quoteJson(r.nextName()))
+                sb.append(": ")
+                prettyJsonInto(r, sb, depth + 1)
+            }
+            r.endObject()
+            if (!first) { sb.append('\n'); repeat(depth) { sb.append("  ") } }
+            sb.append('}')
+        }
+        JsonToken.BEGIN_ARRAY -> {
+            r.beginArray()
+            sb.append('[')
+            var first = true
+            while (r.hasNext()) {
+                if (!first) sb.append(',')
+                first = false
+                sb.append('\n')
+                repeat(depth + 1) { sb.append("  ") }
+                prettyJsonInto(r, sb, depth + 1)
+            }
+            r.endArray()
+            if (!first) { sb.append('\n'); repeat(depth) { sb.append("  ") } }
+            sb.append(']')
+        }
+        JsonToken.STRING -> sb.append(quoteJson(r.nextString()))
+        JsonToken.NUMBER -> sb.append(r.nextString())
+        JsonToken.BOOLEAN -> sb.append(if (r.nextBoolean()) "true" else "false")
+        JsonToken.NULL -> { r.nextNull(); sb.append("null") }
+        else -> { r.skipValue(); sb.append("null") }
+    }
+}
+
+private fun quoteJson(s: String): String {
+    val sb = StringBuilder(s.length + 16)
+    sb.append('"')
+    for (c in s) {
+        when (c) {
+            '"' -> sb.append("\\\"")
+            '\\' -> sb.append("\\\\")
+            '\n' -> sb.append("\\n")
+            '\r' -> sb.append("\\r")
+            '\t' -> sb.append("\\t")
+            '\b' -> sb.append("\\b")
+            '\u000C' -> sb.append("\\f")
+            else -> if (c < ' ') sb.append("\\u").append(String.format("%04x", c.code)) else sb.append(c)
+        }
+    }
+    sb.append('"')
+    return sb.toString()
 }
 
 /** 生成 curl 命令（body 做 gzip 解码 + 单引号转义） */
@@ -206,8 +275,7 @@ fun buildCurl(e: HttpExchange): String {
         sb.append(" \\\n  -H 'Content-Type: ${e.requestContentType}'")
     }
     if (e.requestBody.isNotEmpty()) {
-        val bodyText = decodeBodyPreview(e, request = true, limit = 256 * 1024)
-            ?.replace(Regex("\n\n…\\[截断.*$"), "")
+        val bodyText = decodeBodyPreview(e, request = true)
         if (!bodyText.isNullOrEmpty() && !bodyText.startsWith("[解码失败") &&
             !bodyText.startsWith("[二进制") && !bodyText.startsWith("[无法")
         ) {

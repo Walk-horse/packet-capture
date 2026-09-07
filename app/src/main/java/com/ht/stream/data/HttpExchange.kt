@@ -49,6 +49,6 @@ class HttpExchange(
 
     companion object {
         val counter = AtomicLong(0)
-        const val MAX_BODY = 512 * 1024 // body 截断上限 512KB
+        const val MAX_BODY = 4 * 1024 * 1024 // body 存储上限 4MB（超出截断，尽量留全）
     }
 }

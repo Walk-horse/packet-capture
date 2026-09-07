@@ -326,7 +326,7 @@ fun BuildRequestScreen(onBack: () -> Unit, replay: com.ht.stream.data.HttpExchan
                 val stream = try {
                     if (code >= 400) conn.errorStream else conn.inputStream
                 } catch (_: Exception) { null }
-                resp.bytes = stream?.let { readBounded(BufferedInputStream(it), 512 * 1024) } ?: ByteArray(0)
+                resp.bytes = stream?.let { readBounded(BufferedInputStream(it), 4 * 1024 * 1024) } ?: ByteArray(0)
             } catch (e: Exception) {
                 resp.status = "请求失败"
                 resp.note = e.message ?: e.javaClass.simpleName
