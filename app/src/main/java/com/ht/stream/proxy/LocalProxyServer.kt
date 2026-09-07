@@ -6,6 +6,7 @@ import com.ht.stream.data.CaptureMode
 import com.ht.stream.data.FileLogger
 import com.ht.stream.data.HostsStore
 import com.ht.stream.data.HttpExchange
+import com.ht.stream.data.PassthroughRec
 import com.ht.stream.data.RequestStore
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
@@ -198,14 +199,16 @@ class LocalProxyServer {
         // 该 host 此前 MITM 失败过 → 直接透传，保证 App 可用
         if (host in mitmBlacklist) {
             val stream = BufferedInputStream(SequenceInputStream(ByteArrayInputStream(clientHello), app.getInputStream()), 64 * 1024)
-            blindRelay(app, stream, appOut, destIp, destPort)
+            blindRelay(app, stream, appOut, destIp, destPort,
+                tls = true, hostLabel = sni, reason = "App 不信任 CA，自动透传")
             return
         }
         // 抓包模式（黑/白名单）：不命中的 host 透传不解析
         if (!CaptureMode.shouldMitm(appContext, host)) {
             FileLogger.log("TLS $host bypassed by capture mode")
             val stream = BufferedInputStream(SequenceInputStream(ByteArrayInputStream(clientHello), app.getInputStream()), 64 * 1024)
-            blindRelay(app, stream, appOut, destIp, destPort)
+            blindRelay(app, stream, appOut, destIp, destPort,
+                tls = true, hostLabel = sni, reason = "抓包模式（黑/白名单）排除")
             return
         }
         val serverCtx = try {
@@ -216,7 +219,8 @@ class LocalProxyServer {
         }
         if (serverCtx == null) {
             val stream = BufferedInputStream(SequenceInputStream(ByteArrayInputStream(clientHello), app.getInputStream()), 64 * 1024)
-            blindRelay(app, stream, appOut, destIp, destPort)
+            blindRelay(app, stream, appOut, destIp, destPort,
+                tls = true, hostLabel = sni, reason = "站点证书生成失败，自动透传")
             return
         }
 
@@ -301,8 +305,25 @@ class LocalProxyServer {
 
     // ---------- 盲转发 ----------
 
-    private fun blindRelay(app: Socket, appIn: InputStream, appOut: BufferedOutputStream, destIp: String, destPort: Int) {
-        Log.d(TAG, "blind relay to $destIp:$destPort")
+    /**
+     * 盲转发（透传）。会记录一条未解密的连接元数据：
+     * @param tls 是否嗅探到 TLS 但放弃解密
+     * @param hostLabel 已解析的 SNI 域名（可为 null，此时展示目标 IP）
+     * @param reason 透传原因，展示给用户
+     */
+    private fun blindRelay(
+        app: Socket, appIn: InputStream, appOut: BufferedOutputStream,
+        destIp: String, destPort: Int,
+        tls: Boolean = false, hostLabel: String? = null, reason: String = "非 HTTP 流量"
+    ) {
+        Log.d(TAG, "blind relay to $destIp:$destPort ($reason)")
+        val rec = PassthroughRec(
+            host = hostLabel ?: destIp,
+            port = destPort,
+            tls = tls,
+            reason = reason
+        )
+        RequestStore.addPassthrough(rec)
         val upstream = Socket()
         upstream.soTimeout = 60_000
         upstream.connect(InetSocketAddress(InetAddress.getByName(destIp), destPort), 10_000)
@@ -313,6 +334,7 @@ class LocalProxyServer {
                     while (true) {
                         val n = upstream.getInputStream().read(buf)
                         if (n < 0) break
+                        rec.downBytes.addAndGet(n.toLong())
                         appOut.write(buf, 0, n)
                         appOut.flush()
                     }
@@ -327,6 +349,7 @@ class LocalProxyServer {
                 while (true) {
                     val n = appIn.read(buf)
                     if (n < 0) break
+                    rec.upBytes.addAndGet(n.toLong())
                     upstream.getOutputStream().write(buf, 0, n)
                     upstream.getOutputStream().flush()
                 }
@@ -334,6 +357,7 @@ class LocalProxyServer {
         } finally {
             runCatching { upstream.close() }
             runCatching { app.close() }
+            RequestStore.finishPassthrough(rec)
         }
     }
 

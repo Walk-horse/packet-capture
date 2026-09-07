@@ -42,6 +42,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.ht.stream.data.HttpExchange
+import com.ht.stream.data.PassthroughRec
 import com.ht.stream.data.RequestStore
 
 /** 全部请求列表：sessionId 为 null 表示全部（含进行中） */
@@ -57,7 +58,7 @@ fun RequestListScreen(
     var searchOn by remember { mutableStateOf(false) }
     var filter by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
-    // 切换 全部请求/按域名 时回到顶部
+    // 切换 全部请求/按域名/透传 时回到顶部
     LaunchedEffect(tab) { listState.scrollToItem(0) }
 
     val base = remember(all, sessionId) {
@@ -68,6 +69,15 @@ fun RequestListScreen(
         else base.filter {
             it.host.contains(filter, true) || it.path.contains(filter, true) || it.method.contains(filter, true)
         }
+    }
+    // 未解密（透传）连接：与请求共用同一作用域（全部 / 单个 session）
+    val allPass by RequestStore.passthrough.collectAsState()
+    val basePass = remember(allPass, sessionId) {
+        if (sessionId == null) allPass else allPass.filter { it.sessionId == sessionId }
+    }
+    val filteredPass = remember(basePass, filter) {
+        if (filter.isBlank()) basePass
+        else basePass.filter { it.host.contains(filter, true) }
     }
 
     Column(Modifier.fillMaxSize().background(StreamColors.BgGray)) {
@@ -101,14 +111,17 @@ fun RequestListScreen(
             verticalAlignment = Alignment.CenterVertically
         ) {
             CompactTabs(
-                items = listOf("全部请求", "按域名"),
+                items = listOf("全部请求", "按域名", "透传"),
                 selected = tab,
                 onSelect = { tab = it }
             )
         }
 
         Text(
-            "共 ${filtered.size} 个请求",
+            when (tab) {
+                2 -> "共 ${filteredPass.size} 条未解密连接"
+                else -> "共 ${filtered.size} 个请求"
+            },
             fontSize = 12.sp,
             color = StreamColors.SubText,
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
@@ -122,6 +135,22 @@ fun RequestListScreen(
             if (tab == 0) {
                 items(filtered, key = { it.id }) { e ->
                     ExchangeRow(e) { onOpen(e) }
+                }
+            } else if (tab == 2) {
+                if (filteredPass.isEmpty()) {
+                    item {
+                        Text(
+                            "暂无未解密连接（App 拒绝证书 / 抓包模式排除 / 非 HTTP 流量 时会在此记录域名层元数据）",
+                            fontSize = 12.sp,
+                            color = StreamColors.SubText,
+                            lineHeight = 18.sp,
+                            modifier = Modifier.padding(16.dp)
+                        )
+                    }
+                } else {
+                    items(filteredPass, key = { it.id }) { r ->
+                        PassthroughRow(r)
+                    }
                 }
             } else {
                 val grouped = filtered.groupBy { it.host }.toList().sortedByDescending { it.second.size }
@@ -182,6 +211,50 @@ fun ExchangeRow(e: HttpExchange, onClick: () -> Unit) {
             }
             Text(
                 "${formatSize(e.responseBody.size)} · ${formatDuration(e.durationMs)}",
+                fontSize = 10.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+@Composable
+fun PassthroughRow(r: PassthroughRec) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            Modifier
+                .background(if (r.tls) Color(0xFF455A64) else Color(0xFF78909C), RoundedCornerShape(4.dp))
+                .padding(horizontal = 6.dp, vertical = 2.dp)
+        ) {
+            Text("未解密", color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+        }
+        Spacer(Modifier.width(10.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                r.host, fontSize = 14.sp, fontWeight = FontWeight.Medium,
+                maxLines = 1, overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                "${r.reason} · :${r.port}",
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1, overflow = TextOverflow.Ellipsis
+            )
+        }
+        Spacer(Modifier.width(8.dp))
+        Column(horizontalAlignment = Alignment.End) {
+            Text(
+                "↓${formatBytes(r.downBytes.get())} ↑${formatBytes(r.upBytes.get())}",
+                fontSize = 12.sp, fontWeight = FontWeight.Medium,
+                color = if (r.endTime == 0L) StreamColors.Blue else Color(0xFF37474F)
+            )
+            Text(
+                if (r.endTime == 0L) "连接中…" else formatDuration(r.durationMs),
                 fontSize = 10.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )

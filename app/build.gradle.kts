@@ -71,5 +71,9 @@ dependencies {
     implementation("org.bouncycastle:bcprov-jdk18on:1.79")
     implementation("org.bouncycastle:bcpkix-jdk18on:1.79")
 
+    // body 解压：brotli（纯 Java）+ zstd
+    implementation("org.brotli:dec:0.1.2")
+    implementation("com.github.luben:zstd-jni:1.5.6-8")
+
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

@@ -256,28 +256,11 @@ private fun MessageTab(e: HttpExchange, request: Boolean, searchable: Boolean = 
     } else {
         if (e.statusCode > 0) "HTTP/1.1 ${e.statusCode} ${e.statusText}" else "（尚无响应）"
     }
-    val rawBody = decodeBodyPreview(e, request)
-    val body = prettyJsonIfPossible(rawBody)
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
 
-    var query by remember { mutableStateOf("") }
-    val matchCount = remember(body, query) {
-        if (query.isEmpty() || body == null) 0 else {
-            var c = 0
-            var i = 0
-            while (true) {
-                val idx = body.indexOf(query, i, ignoreCase = true)
-                if (idx < 0) break
-                c++
-                i = idx + query.length
-            }
-            c
-        }
-    }
-    val displayBody = remember(body, query) {
-        if (query.isEmpty() || body == null) AnnotatedString(body ?: "（无内容）")
-        else highlightMatches(body, query)
+    val bodyFileName = remember(e) {
+        "${e.host.replace(Regex("[^A-Za-z0-9._-]"), "_")}_${if (request) "req" else "resp"}"
     }
 
     Column(
@@ -302,87 +285,13 @@ private fun MessageTab(e: HttpExchange, request: Boolean, searchable: Boolean = 
         Spacer(Modifier.height(12.dp))
         HorizontalDivider()
         Spacer(Modifier.height(12.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                "Body",
-                fontSize = 12.sp, fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.weight(1f)
-            )
-            if (!body.isNullOrEmpty()) {
-                Text(
-                    "复制",
-                    fontSize = 12.sp,
-                    color = StreamColors.Blue,
-                    modifier = Modifier.clickable {
-                        clipboard.setText(AnnotatedString(body))
-                        Toast.makeText(context, "Body 已复制", Toast.LENGTH_SHORT).show()
-                    }
-                )
-            }
-        }
-        if (searchable && !body.isNullOrEmpty()) {
-            Spacer(Modifier.height(6.dp))
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .background(Color(0xFFF2F2F7), RoundedCornerShape(8.dp))
-                    .padding(horizontal = 10.dp, vertical = 7.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Icon(
-                    Icons.Default.Search, contentDescription = null,
-                    tint = StreamColors.SubText, modifier = Modifier.size(15.dp)
-                )
-                Spacer(Modifier.width(6.dp))
-                BasicTextField(
-                    value = query,
-                    onValueChange = { query = it },
-                    singleLine = true,
-                    textStyle = TextStyle(fontSize = 13.sp),
-                    modifier = Modifier.weight(1f),
-                    decorationBox = { inner ->
-                        if (query.isEmpty()) Text("搜索 Body 内容", fontSize = 13.sp, color = StreamColors.SubText)
-                        inner()
-                    }
-                )
-                if (query.isNotEmpty()) {
-                    Text(
-                        "$matchCount 处匹配",
-                        fontSize = 11.sp,
-                        color = StreamColors.SubText
-                    )
-                    Spacer(Modifier.width(6.dp))
-                    Icon(
-                        Icons.Default.Close, contentDescription = "清除",
-                        tint = StreamColors.SubText,
-                        modifier = Modifier.size(15.dp).clickable { query = "" }
-                    )
-                }
-            }
-        }
-        Spacer(Modifier.height(4.dp))
-        SelectionContainer {
-            Text(
-                displayBody,
-                fontSize = 12.sp,
-                fontFamily = FontFamily.Monospace,
-                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
-            )
-        }
+        BodyPanel(
+            rawBytes = if (request) e.requestBody else e.responseBody,
+            contentType = if (request) e.requestContentType else e.responseContentType,
+            contentEncoding = e.headerValue(headers, "Content-Encoding"),
+            searchable = searchable,
+            fileName = bodyFileName
+        )
     }
 }
 
-/** 不区分大小写高亮所有匹配片段 */
-private fun highlightMatches(text: String, query: String): AnnotatedString {
-    val builder = AnnotatedString.Builder(text)
-    val hl = SpanStyle(background = Color(0xFFFFD54F), color = Color(0xFF3E2723))
-    var i = 0
-    while (i <= text.length - query.length) {
-        val idx = text.indexOf(query, i, ignoreCase = true)
-        if (idx < 0) break
-        builder.addStyle(hl, idx, idx + query.length)
-        i = idx + query.length
-    }
-    return builder.toAnnotatedString()
-}

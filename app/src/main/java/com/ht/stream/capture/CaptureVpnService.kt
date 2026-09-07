@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import com.ht.stream.R
+import com.ht.stream.data.CaptureMode
 import com.ht.stream.data.FileLogger
 import com.ht.stream.data.RequestStore
 import com.ht.stream.proxy.LocalProxyServer
@@ -169,6 +170,10 @@ class CaptureVpnService : VpnService() {
             Packet.PROTO_UDP -> {
                 val udp = Packet.parseUdp(buf, ip) ?: return
                 if (!isTunAddress(ip.src)) return
+                // QUIC 回退：丢弃到 443 的 UDP，App 会回退到 HTTPS(HTTP/2) 供 MITM 解密
+                if (udp.dstPort == 443 && CaptureMode.quicBlockOn(applicationContext)) {
+                    return
+                }
                 val key = "udp:${Packet.ipKey(ip.src)}:${udp.srcPort}->${Packet.ipKey(ip.dst)}:${udp.dstPort}"
                 val session = udpSessions.getOrPut(key) {
                     UdpSession(

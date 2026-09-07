@@ -38,6 +38,7 @@ fun ModeScreen(onBack: () -> Unit) {
 
     val blackOn = remember(version) { CaptureMode.blacklistOn(context) }
     val whiteOn = remember(version) { CaptureMode.whitelistOn(context) }
+    val quicOn = remember(version) { CaptureMode.quicBlockOn(context) }
 
     editing?.let { which ->
         AlertDialog(
@@ -95,6 +96,14 @@ fun ModeScreen(onBack: () -> Unit) {
                     editing = "white"
                 }
             )
+            ModeSection(
+                title = "HTTP/3 (QUIC) 回退",
+                desc = "启用后拦截 UDP 443 流量，迫使使用 HTTP/3 的 App 回退到 HTTPS（HTTP/2），从而可被解密记录。\n\n注意：少数仅支持 HTTP/3 的服务可能因此无法连接，遇到时请关闭此项。",
+                switchLabel = "启用 QUIC 回退",
+                checked = quicOn,
+                onChecked = { CaptureMode.setQuicBlockOn(context, it); version++ },
+                listLabel = null
+            )
         }
     }
 }
@@ -106,8 +115,8 @@ private fun ModeSection(
     switchLabel: String,
     checked: Boolean,
     onChecked: (Boolean) -> Unit,
-    listLabel: String,
-    onEditList: () -> Unit
+    listLabel: String?,
+    onEditList: (() -> Unit)? = null
 ) {
     Column(Modifier.fillMaxWidth().background(Color.White)) {
         Text(
@@ -130,6 +139,8 @@ private fun ModeSection(
                 colors = SwitchDefaults.colors(checkedTrackColor = StreamColors.Blue)
             )
         })
-        CellRow(listLabel, showChevron = true, onClick = onEditList, showDivider = false)
+        if (listLabel != null) {
+            CellRow(listLabel, showChevron = true, onClick = onEditList ?: {}, showDivider = false)
+        }
     }
 }

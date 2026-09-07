@@ -61,7 +61,8 @@ private data class HeaderPair(var key: String, var value: String)
 private class RespState {
     var status by mutableStateOf("")
     var headers by mutableStateOf("")
-    var body by mutableStateOf("")
+    var bytes by mutableStateOf(ByteArray(0))
+    var note by mutableStateOf("")
 }
 
 private data class ParsedCurl(
@@ -125,9 +126,30 @@ private fun parseCurl(input: String): ParsedCurl? {
     return ParsedCurl(method, url, headers, body)
 }
 
+/** 从响应头部文本中取某个头字段的值（响应头存储为 "K: V" 行） */
+private fun headerFromText(headersText: String, name: String): String? =
+    headersText.lineSequence().firstNotNullOfOrNull { l ->
+        val i = l.indexOf(':')
+        if (i > 0 && l.substring(0, i).trim().equals(name, true)) l.substring(i + 1).trim() else null
+    }
+
+/** 有上限地读取输入流（防止大文件撑爆内存，超出部分丢弃） */
+private fun readBounded(input: java.io.InputStream, max: Int): ByteArray {
+    val out = java.io.ByteArrayOutputStream(minOf(max, 64 * 1024))
+    val buf = ByteArray(8192)
+    var total = 0
+    while (true) {
+        if (total >= max) break
+        val n = input.read(buf, 0, minOf(buf.size, max - total))
+        if (n < 0) break
+        out.write(buf, 0, n)
+        total += n
+    }
+    return out.toByteArray()
+}
+
 /** 按 shell 规则分词（处理单双引号与转义） */
-private fun tokenizeShell(s: String): List<String> {
-    val out = mutableListOf<String>()
+private fun tokenizeShell(s: String): List<String> {    val out = mutableListOf<String>()
     val cur = StringBuilder()
     var quote: Char? = null
     var i = 0
@@ -278,7 +300,7 @@ fun BuildRequestScreen(onBack: () -> Unit, replay: com.ht.stream.data.HttpExchan
             return
         }
         running = true
-        resp.status = ""; resp.headers = ""; resp.body = ""
+        resp.status = ""; resp.headers = ""; resp.bytes = ByteArray(0); resp.note = ""
         val m = method; val u = url.trim()
         val hdrs = headers.map { it.key to it.value }.filter { it.first.isNotBlank() }
         val reqBody = body
@@ -304,12 +326,10 @@ fun BuildRequestScreen(onBack: () -> Unit, replay: com.ht.stream.data.HttpExchan
                 val stream = try {
                     if (code >= 400) conn.errorStream else conn.inputStream
                 } catch (_: Exception) { null }
-                val bytes = stream?.let { BufferedInputStream(it).readBytes() } ?: ByteArray(0)
-                resp.body = if (bytes.isEmpty()) "(空响应体)"
-                else String(bytes, 0, minOf(bytes.size, 256 * 1024), Charsets.UTF_8)
+                resp.bytes = stream?.let { readBounded(BufferedInputStream(it), 512 * 1024) } ?: ByteArray(0)
             } catch (e: Exception) {
                 resp.status = "请求失败"
-                resp.body = e.message ?: e.javaClass.simpleName
+                resp.note = e.message ?: e.javaClass.simpleName
             } finally {
                 conn?.disconnect()
                 running = false
@@ -434,16 +454,9 @@ fun BuildRequestScreen(onBack: () -> Unit, replay: com.ht.stream.data.HttpExchan
                     }
                 }
             } else {
-                // 响应页：样式对齐抓包详情（状态行 + headers + Body 复制/搜索/JSON 美化）
-                val prettyBody = prettyJsonIfPossible(resp.body.ifEmpty { null })
-                var query by remember { mutableStateOf("") }
-                val matchCount = countMatches(prettyBody, query)
-                val displayBody = when {
-                    prettyBody == null -> AnnotatedString("-")
-                    query.isEmpty() -> AnnotatedString(prettyBody)
-                    else -> highlightText(prettyBody, query)
-                }
-
+                // 响应页：状态行 + headers + BodyPanel（文本/UTF-16/HEX、搜索、复制、二进制导出）
+                val respCt = headerFromText(resp.headers, "Content-Type")
+                val respEnc = headerFromText(resp.headers, "Content-Encoding")
                 Column(
                     Modifier
                         .fillMaxSize()
@@ -463,70 +476,14 @@ fun BuildRequestScreen(onBack: () -> Unit, replay: com.ht.stream.data.HttpExchan
                     Spacer(Modifier.height(12.dp))
                     HorizontalDivider()
                     Spacer(Modifier.height(12.dp))
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            "Body",
-                            fontSize = 12.sp, fontWeight = FontWeight.Bold,
-                            color = StreamColors.SubText,
-                            modifier = Modifier.weight(1f)
-                        )
-                        if (!prettyBody.isNullOrEmpty()) {
-                            Text(
-                                "复制",
-                                fontSize = 12.sp,
-                                color = StreamColors.Blue,
-                                modifier = Modifier.clickable {
-                                    clipboard.setText(AnnotatedString(prettyBody))
-                                    Toast.makeText(context, "Body 已复制", Toast.LENGTH_SHORT).show()
-                                }
-                            )
-                        }
-                    }
-                    if (!prettyBody.isNullOrEmpty()) {
-                        Spacer(Modifier.height(6.dp))
-                        Row(
-                            Modifier
-                                .fillMaxWidth()
-                                .background(Color(0xFFF2F2F7), RoundedCornerShape(8.dp))
-                                .padding(horizontal = 10.dp, vertical = 7.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                Icons.Default.Search, contentDescription = null,
-                                tint = StreamColors.SubText, modifier = Modifier.size(15.dp)
-                            )
-                            Spacer(Modifier.width(6.dp))
-                            BasicTextField(
-                                value = query,
-                                onValueChange = { query = it },
-                                singleLine = true,
-                                textStyle = TextStyle(fontSize = 13.sp),
-                                modifier = Modifier.weight(1f),
-                                decorationBox = { inner ->
-                                    if (query.isEmpty()) Text("搜索 Body 内容", fontSize = 13.sp, color = StreamColors.SubText)
-                                    inner()
-                                }
-                            )
-                            if (query.isNotEmpty()) {
-                                Text("$matchCount 处匹配", fontSize = 11.sp, color = StreamColors.SubText)
-                                Spacer(Modifier.width(6.dp))
-                                Icon(
-                                    Icons.Default.Close, contentDescription = "清除",
-                                    tint = StreamColors.SubText,
-                                    modifier = Modifier.size(15.dp).clickable { query = "" }
-                                )
-                            }
-                        }
-                    }
-                    Spacer(Modifier.height(4.dp))
-                    SelectionContainer {
-                        Text(
-                            displayBody,
-                            fontSize = 12.sp,
-                            fontFamily = FontFamily.Monospace,
-                            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
-                        )
-                    }
+                    BodyPanel(
+                        rawBytes = resp.bytes,
+                        contentType = respCt,
+                        contentEncoding = respEnc,
+                        searchable = true,
+                        fileName = "build_request_response",
+                        fallback = resp.note.ifEmpty { null }
+                    )
                 }
             }
             Spacer(Modifier.height(32.dp))

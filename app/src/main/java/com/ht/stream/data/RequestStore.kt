@@ -18,9 +18,13 @@ data class CaptureSession(
 object RequestStore {
     private const val MAX_ENTRIES = 500
     private const val MAX_SESSIONS = 50
+    private const val MAX_PASSTHROUGH = 400
 
     private val _exchanges = MutableStateFlow<List<HttpExchange>>(emptyList())
     val exchanges: StateFlow<List<HttpExchange>> = _exchanges
+
+    private val _passthrough = MutableStateFlow<List<PassthroughRec>>(emptyList())
+    val passthrough: StateFlow<List<PassthroughRec>> = _passthrough
 
     private val _sessions = MutableStateFlow<List<CaptureSession>>(emptyList())
     val sessions: StateFlow<List<CaptureSession>> = _sessions
@@ -71,6 +75,24 @@ object RequestStore {
         _tick.value = System.nanoTime()
     }
 
+    /** 透传连接：连接建立时记录（endTime=0 表示进行中） */
+    @Synchronized
+    fun addPassthrough(p: PassthroughRec) {
+        currentSession?.let { p.sessionId = it.id }
+        val list = _passthrough.value.toMutableList()
+        list.add(0, p)
+        while (list.size > MAX_PASSTHROUGH) list.removeAt(list.size - 1)
+        _passthrough.value = list
+        notifyChanged()
+    }
+
+    /** 透传连接结束时回填时长/字节并刷新 UI */
+    @Synchronized
+    fun finishPassthrough(p: PassthroughRec) {
+        if (p.endTime == 0L) p.endTime = System.currentTimeMillis()
+        notifyChanged()
+    }
+
     @Synchronized
     fun toggleFavorite(id: String) {
         _exchanges.value.firstOrNull { it.id == id }?.let { it.favorite = !it.favorite }
@@ -85,10 +107,11 @@ object RequestStore {
         notifyChanged()
     }
 
-    /** 清空全部历史（请求 + 会话） */
+    /** 清空全部历史（请求 + 透传 + 会话） */
     @Synchronized
     fun clearHistory() {
         _exchanges.value = emptyList()
+        _passthrough.value = emptyList()
         _sessions.value = emptyList()
         notifyChanged()
     }
@@ -98,6 +121,12 @@ object RequestStore {
     fun ofSession(sessionId: String): List<HttpExchange> =
         _exchanges.value.filter { it.sessionId == sessionId }
 
+    fun passthroughOfSession(sessionId: String): List<PassthroughRec> =
+        _passthrough.value.filter { it.sessionId == sessionId }
+
     fun sessionRequestCount(sessionId: String): Int =
         _exchanges.value.count { it.sessionId == sessionId }
+
+    fun sessionPassthroughCount(sessionId: String): Int =
+        _passthrough.value.count { it.sessionId == sessionId }
 }
