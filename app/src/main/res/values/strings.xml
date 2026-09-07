@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Packet Capture</string>
+    <string name="notification_channel">抓包服务</string>
+    <string name="notification_text">正在抓取网络请求</string>
+</resources>

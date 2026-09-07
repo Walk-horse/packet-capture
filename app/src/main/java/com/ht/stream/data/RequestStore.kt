@@ -1,0 +1,103 @@
+package com.ht.stream.data
+
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
+
+/** 一次抓包会话（开始~停止） */
+data class CaptureSession(
+    val id: String = UUID.randomUUID().toString(),
+    val startTime: Long = System.currentTimeMillis(),
+    var endTime: Long = 0
+) {
+    val durationSec: Long get() = ((if (endTime > 0) endTime else System.currentTimeMillis()) - startTime) / 1000
+}
+
+/** 抓包记录的内存仓库，UI 通过 StateFlow 订阅 */
+object RequestStore {
+    private const val MAX_ENTRIES = 500
+    private const val MAX_SESSIONS = 50
+
+    private val _exchanges = MutableStateFlow<List<HttpExchange>>(emptyList())
+    val exchanges: StateFlow<List<HttpExchange>> = _exchanges
+
+    private val _sessions = MutableStateFlow<List<CaptureSession>>(emptyList())
+    val sessions: StateFlow<List<CaptureSession>> = _sessions
+
+    /** 当前进行中的 session（停止抓包后置 null） */
+    @Volatile var currentSession: CaptureSession? = null
+        private set
+
+    /** 整机流量统计（经 TUN 的字节数） */
+    val uploadBytes = AtomicLong(0)
+    val downloadBytes = AtomicLong(0)
+
+    /** 任意 exchange 字段变化时 +1，驱动详情页刷新 */
+    private val _tick = MutableStateFlow(0L)
+    val tick: StateFlow<Long> = _tick
+
+    @Synchronized
+    fun startSession() {
+        val s = CaptureSession()
+        currentSession = s
+        val list = _sessions.value.toMutableList()
+        list.add(0, s)
+        while (list.size > MAX_SESSIONS) list.removeAt(list.size - 1)
+        _sessions.value = list
+        uploadBytes.set(0)
+        downloadBytes.set(0)
+        notifyChanged()
+    }
+
+    @Synchronized
+    fun endSession() {
+        currentSession?.endTime = System.currentTimeMillis()
+        currentSession = null
+        notifyChanged()
+    }
+
+    @Synchronized
+    fun add(e: HttpExchange) {
+        currentSession?.let { e.sessionId = it.id }
+        val list = _exchanges.value.toMutableList()
+        list.add(0, e)
+        while (list.size > MAX_ENTRIES) list.removeAt(list.size - 1)
+        _exchanges.value = list
+        notifyChanged()
+    }
+
+    fun notifyChanged() {
+        _tick.value = System.nanoTime()
+    }
+
+    @Synchronized
+    fun toggleFavorite(id: String) {
+        _exchanges.value.firstOrNull { it.id == id }?.let { it.favorite = !it.favorite }
+        notifyChanged()
+    }
+
+    fun favorites(): List<HttpExchange> = _exchanges.value.filter { it.favorite }
+
+    @Synchronized
+    fun deleteExchanges(ids: Set<String>) {
+        _exchanges.value = _exchanges.value.filterNot { it.id in ids }
+        notifyChanged()
+    }
+
+    /** 清空全部历史（请求 + 会话） */
+    @Synchronized
+    fun clearHistory() {
+        _exchanges.value = emptyList()
+        _sessions.value = emptyList()
+        notifyChanged()
+    }
+
+    fun find(id: String): HttpExchange? = _exchanges.value.firstOrNull { it.id == id }
+
+    fun ofSession(sessionId: String): List<HttpExchange> =
+        _exchanges.value.filter { it.sessionId == sessionId }
+
+    fun sessionRequestCount(sessionId: String): Int =
+        _exchanges.value.count { it.sessionId == sessionId }
+}
