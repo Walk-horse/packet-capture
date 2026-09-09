@@ -22,8 +22,9 @@ object CaptureMode {
     fun blacklistOn(context: Context): Boolean = prefs(context).getBoolean(KEY_BLACK_ON, false)
     fun whitelistOn(context: Context): Boolean = prefs(context).getBoolean(KEY_WHITE_ON, false)
 
-    /** 启用「QUIC 回退」：拦截 UDP 443，迫使 HTTP/3 流量降级为 HTTPS(HTTP/2) 以便解密 */
-    fun quicBlockOn(context: Context): Boolean = prefs(context).getBoolean(KEY_QUIC_BLOCK, false)
+    /** 启用「QUIC 回退」：拦截 UDP 443，迫使 HTTP/3 流量降级为 HTTPS(HTTP/2) 以便解密。
+     *  默认开启：否则 HTTP/3 接口会直接走 UDP 透传、永远抓不到（与代理类工具行为一致）。 */
+    fun quicBlockOn(context: Context): Boolean = prefs(context).getBoolean(KEY_QUIC_BLOCK, true)
 
     fun setBlacklistOn(context: Context, on: Boolean) =
         prefs(context).edit().putBoolean(KEY_BLACK_ON, on).apply()

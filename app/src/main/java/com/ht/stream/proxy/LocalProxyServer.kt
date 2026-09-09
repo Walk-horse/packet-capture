@@ -39,13 +39,29 @@ class LocalProxyServer {
             "GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "CONNECT", "TRACE"
         )
 
-        /** 握手失败过的 host：之后直连盲转发（不信任本 CA 的 App 不再被打断） */
-        private val mitmBlacklist = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+        /**
+         * 握手失败过的 host → 最近失败时间戳。
+         * 冷却期内直连盲转发以免反复打断 App；冷却结束后允许重新尝试 MITM，
+         * 这样一旦目标 App 信任本 CA（或用户修正网络配置），下一次连接即可被解密捕获，
+         * 而不会像「永久黑名单」那样一次失败就永远透传、再也抓不到。
+         */
+        private val mitmFailAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+        private const val MITM_RETRY_COOLDOWN_MS = 60_000L
 
         /** 清除 MITM 缓存：站点证书缓存 + 失败黑名单 */
         fun clearMitmCache() {
-            mitmBlacklist.clear()
+            mitmFailAt.clear()
             CertAuthority.clearCache()
+        }
+
+        /** 该 host 是否仍处于「近期 MITM 失败」冷却期；过期则移除并允许重试 */
+        private fun recentlyFailedMitm(host: String): Boolean {
+            val t = mitmFailAt[host] ?: return false
+            if (System.currentTimeMillis() - t > MITM_RETRY_COOLDOWN_MS) {
+                mitmFailAt.remove(host)
+                return false
+            }
+            return true
         }
     }
 
@@ -198,8 +214,8 @@ class LocalProxyServer {
         destIp: String, destPort: Int, sni: String?, uid: Int
     ) {
         val host = sni ?: destIp
-        // 该 host 此前 MITM 失败过 → 直接透传，保证 App 可用
-        if (host in mitmBlacklist) {
+        // 该 host 近期 MITM 失败过 → 冷却期内透传，保证 App 可用；过期后下方会重试
+        if (recentlyFailedMitm(host)) {
             val stream = BufferedInputStream(SequenceInputStream(ByteArrayInputStream(clientHello), app.getInputStream()), 64 * 1024)
             blindRelay(app, stream, appOut, destIp, destPort,
                 tls = true, hostLabel = sni, reason = "App 不信任 CA，自动透传")
@@ -236,9 +252,10 @@ class LocalProxyServer {
             s
         } catch (e: Exception) {
             // 多半是 App 不信任我们的 CA（Android 7+ 默认不信任用户证书）。
-            // 拉入黑名单：该 host 后续连接一律透传，不再打断 App。
+            // 记录失败时间进入冷却期：冷却内透传不打断 App；冷却结束后会自动重试 MITM，
+            // 若此时已正确安装/信任本 CA 即可正常解密（不再「一次失败永远透传」）。
             Log.d(TAG, "TLS handshake with app failed ($host): ${e.message}")
-            mitmBlacklist.add(host)
+            mitmFailAt[host] = System.currentTimeMillis()
             runCatching { app.close() }
             return
         }

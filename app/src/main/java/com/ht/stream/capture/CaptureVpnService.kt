@@ -81,6 +81,9 @@ class CaptureVpnService : VpnService() {
             stopSelf()
             return
         }
+        // 每次开始抓包都清空 MITM 失败黑名单，重新尝试解密。
+        // 这样之前因 CA 未装好而失败的 host，在本次抓包里有机会被正常捕获。
+        LocalProxyServer.clearMitmCache()
 
         val fd = Builder()
             .setSession("Packet capture")
