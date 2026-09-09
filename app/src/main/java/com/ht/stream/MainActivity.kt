@@ -18,6 +18,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
 import com.ht.stream.capture.CaptureVpnService
 import com.ht.stream.data.RequestStore
+import com.ht.stream.sync.SyncPrefs
+import com.ht.stream.sync.SyncServer
 import com.ht.stream.ui.BuildRequestScreen
 import com.ht.stream.ui.DetailScreen
 import com.ht.stream.ui.FavoritesScreen
@@ -55,6 +57,11 @@ class MainActivity : ComponentActivity() {
         // 调试通道：am start --ez autostart true 自动开始抓包（需已授予 VPN 权限）
         if (intent.getBooleanExtra("autostart", false) && VpnService.prepare(this) == null) {
             startCapture(this)
+        }
+        // 调试通道：am start --ez sync_on true 直接开启桌面同步服务（无需点 UI）
+        if (intent.getBooleanExtra("sync_on", false)) {
+            SyncPrefs.setOn(this, true)
+            SyncServer.start()
         }
         setContent { StreamTheme { Root() } }
     }

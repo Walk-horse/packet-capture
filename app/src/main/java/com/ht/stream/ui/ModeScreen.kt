@@ -1,5 +1,9 @@
 package com.ht.stream.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -15,6 +19,7 @@ import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -27,6 +32,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.ht.stream.data.CaptureMode
+import com.ht.stream.sync.SyncPrefs
+import com.ht.stream.sync.SyncServer
 
 /** 设置抓包模式：黑名单 / 白名单 */
 @Composable
@@ -35,6 +42,8 @@ fun ModeScreen(onBack: () -> Unit) {
     var version by remember { mutableIntStateOf(0) }
     var editing by remember { mutableStateOf<String?>(null) } // "black" / "white"
     var editText by remember { mutableStateOf("") }
+    var syncOn by remember { mutableStateOf(SyncPrefs.isOn(context)) }
+    LaunchedEffect(Unit) { if (syncOn) SyncServer.start() }
 
     val blackOn = remember(version) { CaptureMode.blacklistOn(context) }
     val whiteOn = remember(version) { CaptureMode.whitelistOn(context) }
@@ -103,6 +112,57 @@ fun ModeScreen(onBack: () -> Unit) {
                 checked = quicOn,
                 onChecked = { CaptureMode.setQuicBlockOn(context, it); version++ },
                 listLabel = null
+            )
+
+            SectionHeader("同步数据到电脑")
+            Group {
+                CellRow(
+                    title = "同步数据到电脑",
+                    subtitle = if (syncOn) "局域网同步服务已启动" else "开启后手机提供 HTTP 同步服务",
+                    onClick = null,
+                    trailing = {
+                        Switch(
+                            checked = syncOn,
+                            onCheckedChange = { on ->
+                                val ok = if (on) SyncServer.start() else true
+                                if (on && !ok) {
+                                    Toast.makeText(
+                                        context,
+                                        SyncServer.lastError ?: "同步服务启动失败",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                } else {
+                                    if (!on) SyncServer.stop()
+                                    syncOn = on
+                                    SyncPrefs.setOn(context, on)
+                                    Toast.makeText(
+                                        context,
+                                        if (on) "同步服务已启动" else "同步服务已停止",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                }
+                            }
+                        )
+                    },
+                    showDivider = syncOn
+                )
+                if (syncOn) {
+                    val addr = "http://${SyncServer.address}/api/state"
+                    CellRow(
+                        title = "同步地址（点击复制）",
+                        subtitle = addr,
+                        showDivider = false,
+                        onClick = {
+                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                            cm?.setPrimaryClip(ClipData.newPlainText("sync", addr))
+                            Toast.makeText(context, "已复制同步地址", Toast.LENGTH_SHORT).show()
+                        }
+                    )
+                }
+            }
+            GroupNote(
+                "在 Mac 端 desktool 面板填写上面的同步地址，即可自动同步抓包数据。\n\n" +
+                    "要求：手机与电脑处在同一 Wi-Fi 局域网；同步服务随 App 进程存活（抓包期间由前台服务保活）。"
             )
         }
     }
