@@ -64,14 +64,35 @@ object CertAuthority {
         val certFile = File(context.filesDir, "packetcapture_ca.pem")
         val keyFile = File(context.filesDir, "packetcapture_ca_key.pem")
         return try {
-            if (certFile.exists() && keyFile.exists()) {
-                loadCa(certFile, keyFile)
-            } else {
-                generateCa(certFile, keyFile)
+            // 优先使用 assets 内置的固定 CA：debug/release 共用同一张，
+            // 设备装一次即可两包都生效（避免换包后 CA 不匹配导致 WebView H5 透传）。
+            if (!loadBundledCa(context, certFile, keyFile)) {
+                if (certFile.exists() && keyFile.exists()) {
+                    loadCa(certFile, keyFile)
+                } else {
+                    generateCa(certFile, keyFile)
+                }
             }
+            // 缓存到 filesDir 供导出 / 安装引导 UI 使用
+            certFile.writeText(toPem(caCert!!))
+            keyFile.writeText(toPkcs8Pem(caKey!!))
             true
         } catch (e: Exception) {
             Log.e(TAG, "ensureCa failed", e)
+            false
+        }
+    }
+
+    /** 从 assets 拷贝内置固定 CA 到 filesDir 并加载；assets 缺失时返回 false */
+    private fun loadBundledCa(context: Context, certFile: File, keyFile: File): Boolean {
+        return try {
+            context.assets.open("ca_cert.pem").use { it.copyTo(certFile.outputStream()) }
+            context.assets.open("ca_key.pem").use { it.copyTo(keyFile.outputStream()) }
+            loadCa(certFile, keyFile)
+            Log.i(TAG, "loaded bundled CA from assets")
+            true
+        } catch (e: Exception) {
+            Log.d(TAG, "no bundled CA in assets, fallback to generate", e)
             false
         }
     }
