@@ -37,6 +37,44 @@ struct ContentView: View {
                 Image(systemName: "iphone")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
+                Button {
+                    Task { await client.detectUsb() }
+                } label: {
+                    Image(systemName: "cable.connector")
+                }
+                .controlSize(.small)
+                .help("通过 USB 探测手机地址（连接多台时可选择）")
+                .popover(isPresented: $client.needsPick, arrowEdge: .bottom) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("选择要抓取的手机")
+                            .font(.headline)
+                            .padding(.bottom, 2)
+                        ForEach(client.devices) { dev in
+                            Button {
+                                Task { await client.selectDevice(dev) }
+                                client.needsPick = false
+                            } label: {
+                                HStack(spacing: 6) {
+                                    if client.selectedSerial == dev.serial {
+                                        Image(systemName: "checkmark").foregroundStyle(.blue)
+                                    }
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        Text(dev.model.isEmpty ? dev.serial : dev.model)
+                                            .font(.system(size: 12))
+                                        if !dev.model.isEmpty {
+                                            Text(dev.serial)
+                                                .font(.caption2)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(12)
+                    .frame(minWidth: 220)
+                }
                 TextField("手机地址，如 192.168.1.20:17890", text: $client.address)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 11))
