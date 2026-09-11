@@ -12,15 +12,13 @@ import java.util.Locale
 import java.util.zip.GZIPInputStream
 import java.util.zip.InflaterInputStream
 
-/** 资源类型分类（仿 DevTools Network 面板） */
+/** 资源类型分类 */
 enum class ReqType(val label: String) {
     ALL("全部"),
-    XHR("Fetch/XHR"),
     DOC("文档"),
-    CSS("CSS"),
-    JS("JS"),
     IMG("图片"),
-    WASM("Wasm"),
+    CSSJS("css/js"),
+    WASM("wasm"),
     OTHER("其他");
 
     companion object {
@@ -31,7 +29,7 @@ enum class ReqType(val label: String) {
 
 /**
  * 按 Content-Type（响应优先）归类资源类型，缺失/不明确时按 path 扩展名兜底。
- * 抓包层无法感知页面发起类型（fetch/xhr/document），JSON/XML/表单等 API 响应归为 Fetch/XHR。
+ * 仅保留 文档 / 图片 / css-js / wasm / 其他 五类；JSON/XML/表单等 API 响应归入「其他」。
  */
 fun classifyType(e: HttpExchange): ReqType {
     val ct = (e.responseContentType ?: e.requestContentType ?: "")
@@ -41,13 +39,10 @@ fun classifyType(e: HttpExchange): ReqType {
     return when {
         ct.startsWith("image/") -> ReqType.IMG
         ct.startsWith("application/wasm") -> ReqType.WASM
-        ct == "text/css" -> ReqType.CSS
-        ct.contains("javascript") || ct.contains("ecmascript") || ct.contains("x-javascript") -> ReqType.JS
+        ct == "text/css" -> ReqType.CSSJS
+        ct.contains("javascript") || ct.contains("ecmascript") || ct.contains("x-javascript") -> ReqType.CSSJS
         ct.contains("html") || ct == "application/xhtml+xml" -> ReqType.DOC
-        ct.contains("json") || ct.contains("xml") || ct.contains("x-www-form-urlencoded") ||
-            ct.contains("multipart/form-data") -> ReqType.XHR
-        hasExt(".css") -> ReqType.CSS
-        hasExt(".js", ".mjs", ".cjs") -> ReqType.JS
+        hasExt(".css", ".js", ".mjs", ".cjs") -> ReqType.CSSJS
         hasExt(".html", ".htm") -> ReqType.DOC
         hasExt(".wasm") -> ReqType.WASM
         hasExt(".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp", ".avif", ".heic", ".webp") -> ReqType.IMG
@@ -301,7 +296,8 @@ private fun prettyJsonInto(r: JsonReader, sb: StringBuilder, depth: Int) {
     }
 }
 
-private fun quoteJson(s: String): String {
+/** JSON 字符串字面量化（含转义），供美化输出与 JSON 树展示复用 */
+internal fun quoteJson(s: String): String {
     val sb = StringBuilder(s.length + 16)
     sb.append('"')
     for (c in s) {

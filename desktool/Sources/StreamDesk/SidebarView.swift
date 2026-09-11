@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct SidebarView: View {
     @EnvironmentObject var client: SyncClient
@@ -18,14 +19,19 @@ struct SidebarView: View {
         let all = domains
         let visible = showAllDomains ? all : Array(all.prefix(domainLimit))
         List(selection: $panel) {
-            Section("会话") {
+            // 当前抓包信息
+            Section("当前抓包") {
+                CurrentCaptureCard()
                 HStack {
                     Label("全部请求", systemImage: "tray.full")
                     Spacer()
                     countBadge(client.exchanges.count)
                 }
                 .tag(Panel.all)
+            }
 
+            // 历史抓包记录
+            Section("历史记录") {
                 ForEach(client.sessions) { s in
                     HStack(spacing: 6) {
                         Image(systemName: s.endTime == 0 ? "record.circle" : "checkmark.circle")
@@ -42,6 +48,11 @@ struct SidebarView: View {
                         countBadge(s.requestCount)
                     }
                     .tag(Panel.session(s.id))
+                }
+                if client.sessions.isEmpty {
+                    Text("暂无历史会话")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
                 }
             }
 
@@ -94,6 +105,55 @@ struct SidebarView: View {
     }
 }
 
+/// 当前抓包状态卡：抓包中/未开始、实时计时、上行/下行、请求/透传。
+private struct CurrentCaptureCard: View {
+    @EnvironmentObject var client: SyncClient
+    @State private var nowTick = Date()
+
+    private let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        let elapsed: Int64? = (client.stats.capturing && client.stats.startedAt > 0)
+            ? max(0, Int64(nowTick.timeIntervalSince1970 * 1000) - client.stats.startedAt)
+            : nil
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(client.stats.capturing ? .green : .gray)
+                    .frame(width: 8, height: 8)
+                Text(client.stats.capturing ? "手机正在抓包" : "未在抓包")
+                    .font(.system(size: 12, weight: .medium))
+                Spacer()
+                if let e = elapsed {
+                    Text(fmtDuration(Int64(e)))
+                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            HStack(spacing: 4) {
+                statCell("上行", fmtSize(Int(client.stats.upload)))
+                statCell("下行", fmtSize(Int(client.stats.download)))
+            }
+            HStack(spacing: 4) {
+                statCell("请求", "\(client.stats.requests)")
+                statCell("透传", "\(client.stats.passthrough)")
+            }
+        }
+        .padding(10)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .onReceive(timer) { t in nowTick = t }
+    }
+
+    private func statCell(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title).font(.system(size: 10)).foregroundStyle(.secondary)
+            Text(value).font(.system(size: 12, weight: .medium)).monospacedDigit()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 private struct StatsBar: View {
     @EnvironmentObject var client: SyncClient
 
@@ -101,14 +161,13 @@ private struct StatsBar: View {
         VStack(alignment: .leading, spacing: 6) {
             Divider()
             HStack(spacing: 6) {
-                Circle()
-                    .fill(client.stats.capturing ? .green : .gray)
-                    .frame(width: 7, height: 7)
-                Text(client.stats.capturing ? "手机正在抓包" : "未在抓包")
-                    .font(.system(size: 11, weight: .medium))
+                Image(systemName: client.wsConnected ? "bolt.fill" : "bolt")
+                    .foregroundStyle(client.wsConnected ? .green : .secondary)
+                    .font(.system(size: 11))
+                Text(client.wsConnected ? "推送已连接" : "推送未连接")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
             }
-            statRow("请求 / 透传", "\(client.stats.requests) / \(client.stats.passthrough)")
-            statRow("上传 / 下载", "\(fmtSize(Int(client.stats.upload))) / \(fmtSize(Int(client.stats.download)))")
             statRow("本地已同步", "\(client.exchanges.count) 条")
         }
         .padding(.horizontal, 12)

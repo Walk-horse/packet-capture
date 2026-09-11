@@ -3,6 +3,7 @@ package com.ht.stream.sync
 import android.util.Base64
 import com.ht.stream.capture.CaptureVpnService
 import com.ht.stream.data.HttpExchange
+import com.ht.stream.data.PassthroughRec
 import com.ht.stream.data.RequestStore
 import com.ht.stream.ui.decodeBodyPreview
 import org.json.JSONArray
@@ -40,10 +41,41 @@ object SyncJson {
         obj.put("downloadBytes", RequestStore.downloadBytes.get())
         obj.put("requestCount", exchanges.size)
         obj.put("passthroughCount", RequestStore.passthrough.value.size)
+        obj.put("startedAt", CaptureVpnService.startedAt.value)
         obj.put("full", full)
         obj.put("sessions", sessions())
         obj.put("passthrough", passthroughs())
         obj.put("exchanges", JSONArray().apply { slice.forEach { put(exchange(it)) } })
+        return obj
+    }
+
+    /** WS 连接建立时的全量快照（含 type 标记） */
+    fun wsSnapshot(): JSONObject {
+        val s = state(null)
+        s.put("type", "snapshot")
+        return s
+    }
+
+    /** WS 增量：自 lastEx / lastPass 之后新增的请求与透传（按时间倒序的新条目），附最新统计。
+     *  若游标失效（如清空历史后），回退为全量下发，避免漏推。 */
+    fun wsDelta(lastEx: String?, lastPass: String?): JSONObject {
+        val exchanges = RequestStore.exchanges.value
+        val exIdx = lastEx?.let { id -> exchanges.indexOfFirst { it.id == id } } ?: -1
+        val newEx = if (exIdx < 0) exchanges else exchanges.subList(0, exIdx)
+        val passNow = RequestStore.passthrough.value
+        val pIdx = lastPass?.let { id -> passNow.indexOfFirst { it.id == id } } ?: -1
+        val newPass = if (pIdx < 0) passNow else passNow.subList(0, pIdx)
+
+        val obj = JSONObject()
+        obj.put("type", "delta")
+        obj.put("capturing", CaptureVpnService.running.value)
+        obj.put("uploadBytes", RequestStore.uploadBytes.get())
+        obj.put("downloadBytes", RequestStore.downloadBytes.get())
+        obj.put("requestCount", exchanges.size)
+        obj.put("passthroughCount", passNow.size)
+        obj.put("startedAt", CaptureVpnService.startedAt.value)
+        obj.put("exchanges", JSONArray().apply { newEx.forEach { put(exchange(it)) } })
+        obj.put("passthrough", JSONArray().apply { newPass.forEach { put(passthrough(it)) } })
         return obj
     }
 
@@ -61,21 +93,23 @@ object SyncJson {
     }
 
     private fun passthroughs(): JSONArray = JSONArray().apply {
-        RequestStore.passthrough.value.forEach { p ->
-            val o = JSONObject()
-            o.put("id", p.id)
-            o.put("sessionId", p.sessionId)
-            o.put("host", p.host)
-            o.put("port", p.port)
-            o.put("tls", p.tls)
-            o.put("reason", p.reason)
-            o.put("startTime", p.startTime)
-            o.put("endTime", p.endTime)
-            o.put("durationMs", p.durationMs)
-            o.put("upBytes", p.upBytes.get())
-            o.put("downBytes", p.downBytes.get())
-            put(o)
-        }
+        RequestStore.passthrough.value.forEach { p -> put(passthrough(p)) }
+    }
+
+    private fun passthrough(p: PassthroughRec): JSONObject {
+        val o = JSONObject()
+        o.put("id", p.id)
+        o.put("sessionId", p.sessionId)
+        o.put("host", p.host)
+        o.put("port", p.port)
+        o.put("tls", p.tls)
+        o.put("reason", p.reason)
+        o.put("startTime", p.startTime)
+        o.put("endTime", p.endTime)
+        o.put("durationMs", p.durationMs)
+        o.put("upBytes", p.upBytes.get())
+        o.put("downBytes", p.downBytes.get())
+        return o
     }
 
     private fun exchange(e: HttpExchange): JSONObject {

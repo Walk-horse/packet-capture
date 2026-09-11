@@ -116,6 +116,16 @@ object RequestStore {
         notifyChanged()
     }
 
+    /** 清空当前抓包页展示的数据（请求 + 未解密连接），并复位流量计数 */
+    @Synchronized
+    fun clearCurrent() {
+        _exchanges.value = emptyList()
+        _passthrough.value = emptyList()
+        uploadBytes.set(0)
+        downloadBytes.set(0)
+        notifyChanged()
+    }
+
     fun find(id: String): HttpExchange? = _exchanges.value.firstOrNull { it.id == id }
 
     fun ofSession(sessionId: String): List<HttpExchange> =

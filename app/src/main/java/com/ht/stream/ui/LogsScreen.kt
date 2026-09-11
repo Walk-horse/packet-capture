@@ -61,7 +61,7 @@ fun LogsScreen(onBack: () -> Unit, onOpen: (String) -> Unit) {
                 files.forEachIndexed { i, f ->
                     CellRow(
                         title = f.name,
-                        subtitle = "${timeFmt.format(Date(f.lastModified()))} · ${formatByteSize(f.length())}",
+                        subtitle = "${timeFmt.format(Date(f.lastModified()))} · ${formatBytes(f.length())}",
                         showChevron = true,
                         onClick = { onOpen(f.name) },
                         showDivider = i < files.size - 1
