@@ -8,10 +8,24 @@ struct SyncState: Decodable {
     let downloadBytes: Int64
     let requestCount: Int
     let passthroughCount: Int
+    let startedAt: Int64
     let full: Bool
     let sessions: [SessionInfo]
     let passthrough: [PassRecord]
     let exchanges: [ExchangeRecord]
+}
+
+/// 手机端 WS 推送消息（快照 / 增量），与 SyncJson.wsSnapshot / wsDelta 字段对应
+struct WsMessage: Decodable {
+    let type: String            // "snapshot" | "delta"
+    let capturing: Bool
+    let uploadBytes: Int64
+    let downloadBytes: Int64
+    let requestCount: Int
+    let passthroughCount: Int
+    let startedAt: Int64
+    let exchanges: [ExchangeRecord]
+    let passthrough: [PassRecord]
 }
 
 struct SessionInfo: Decodable, Identifiable, Hashable {

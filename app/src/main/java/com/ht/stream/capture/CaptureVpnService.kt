@@ -81,6 +81,7 @@ class CaptureVpnService : VpnService() {
             stopSelf()
             return
         }
+        UidResolver.init(applicationContext)
         // 每次开始抓包都清空 MITM 失败黑名单，重新尝试解密。
         // 这样之前因 CA 未装好而失败的 host，在本次抓包里有机会被正常捕获。
         LocalProxyServer.clearMitmCache()
@@ -164,7 +165,10 @@ class CaptureVpnService : VpnService() {
                         appIp = ip.src, appPort = tcp.srcPort,
                         remoteIp = ip.dst, remotePort = tcp.dstPort,
                         proxyPort = proxyServer.port,
-                        uid = UidResolver.uidOf(tcp.srcPort),
+                        uid = resolveUid(
+                            localIp = Packet.ipKey(ip.src), localPort = tcp.srcPort,
+                            remoteIp = Packet.ipKey(ip.dst), remotePort = tcp.dstPort
+                        ),
                         writeToTun = { writeToTun(it) },
                         onClose = { tcpSessions.remove(it) }
                     )
@@ -192,6 +196,14 @@ class CaptureVpnService : VpnService() {
             }
         }
     }
+
+    /**
+     * 解析连接所属 uid（见 [UidResolver]）。
+     * 实测：SYN 时刻极少查不到的连接，都是未建立即被放弃的连接（重试也查不到），
+     * 且不会产生 HTTP 记录，故不做重试，避免拖慢 TUN 读线程。
+     */
+    private fun resolveUid(localIp: String, localPort: Int, remoteIp: String, remotePort: Int): Int =
+        UidResolver.uidOf(localIp, localPort, remoteIp, remotePort)
 
     private fun isTunAddress(ip: ByteArray): Boolean =
         ip.size == 4 && ip[0].toInt() == 10 && ip[1].toInt() == 0 && ip[2].toInt() == 0

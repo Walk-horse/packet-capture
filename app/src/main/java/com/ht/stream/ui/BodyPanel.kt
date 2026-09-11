@@ -48,7 +48,7 @@ import java.io.File
 
 /**
  * Body 查看器：解压(gzip/deflate/brotli/zstd) → 文本判定 → 魔数识别。
- * 支持 文本 / UTF-16 / HEX 三种视角，二进制可一键导出文件。
+ * 支持 文本 / JSON(按节点展开折叠) / UTF-16 / HEX 多种视角，二进制可一键导出文件。
  */
 @Composable
 fun BodyPanel(
@@ -57,13 +57,15 @@ fun BodyPanel(
     contentEncoding: String?,
     searchable: Boolean,
     fileName: String,
-    fallback: String? = null
+    fallback: String? = null,
+    // 额外的头部动作（如请求页的「cURL」），渲染在「复制」按钮左侧
+    actionSlot: (@Composable () -> Unit)? = null
 ) {
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
 
-    // 0=文本 1=UTF-16 2=HEX
-    var mode by remember { mutableIntStateOf(0) }
+    // 0=文本 1=JSON 树 2=UTF-16 3=HEX；未手动切换时，JSON body 默认进树形视角
+    var modeSel by remember { mutableStateOf<Int?>(null) }
     var query by remember { mutableStateOf("") }
 
     val decompressed = remember(rawBytes, contentEncoding) {
@@ -78,30 +80,58 @@ fun BodyPanel(
     val prettyText = remember(rawText) { if (rawText == null) null else prettyJsonIfPossible(rawText) }
     val bodySizeText = formatBytes(body.size.toLong())
 
-    val modeText = when (mode) {
-        1 -> utf16Text(body)
-        2 -> hexDump(body)
-        else -> null
-    }
+    // JSON 树（仅当文本可解析为 JSON 时可用）
+    val jsonResult = remember(rawText) { parseJsonTree(rawText) }
+    val jsonRoot = (jsonResult as? JsonTreeResult.Ok)?.root
+    val jsonTooLarge = jsonResult is JsonTreeResult.TooLarge
+
+    // 树不可用时（换了一条非 JSON 记录）回落到文本视角
+    val effMode = modeSel?.let { if (it == 1 && jsonRoot == null) 0 else it }
+        ?: if (jsonRoot != null) 1 else 0
+
     val displayBody: String? = when {
         decompressFailed -> "[解码失败：$contentEncoding，原始 ${formatBytes(rawBytes.size.toLong())} 字节]"
         body.isEmpty() -> if (fallback != null) fallback else null
-        mode == 0 -> prettyText ?: if (isBinary) null else rawText
-        else -> modeText
+        effMode == 0 -> prettyText ?: if (isBinary) null else rawText
+        effMode == 2 -> utf16Text(body)
+        effMode == 3 -> hexDump(body)
+        else -> null
     }
+    // 「复制」目标：JSON 树模式下复制美化后的 JSON 全文
+    val copyText: String? = if (effMode == 1) (prettyText ?: rawText) else displayBody
 
     // 二进制时的引导说明
     val binaryNote = when {
-        !isBinary || mode != 0 -> null
+        !isBinary || effMode != 0 -> null
         sniff != null -> "已识别为 ${sniff.display}（${bodySizeText}），可用 HEX 查看或「导出」后用对应工具打开"
         else -> "未识别出常见文件格式（${bodySizeText}），可切换 HEX / UTF-16 排查，或「导出」为文件分析"
     }
 
-    val matchCount = countMatches(displayBody, query)
+    val matchCount = when (effMode) {
+        0 -> countMatches(displayBody, query)
+        1 -> jsonRoot?.let { countJsonMatches(it, query) } ?: 0
+        else -> 0
+    }
     val shownText = when {
         displayBody == null -> null
         query.isEmpty() -> AnnotatedString(displayBody)
         else -> highlightText(displayBody, query)
+    }
+
+    // 搜索框：文本视角（全文高亮）与 JSON 视角（过滤 + 高亮）都支持
+    val searchVisible = searchable && when (effMode) {
+        0 -> displayBody != null && displayBody.isNotEmpty()
+        1 -> jsonRoot != null
+        else -> false
+    }
+
+    val viewChips = remember(jsonRoot) {
+        buildList {
+            add("文本" to 0)
+            if (jsonRoot != null) add("JSON" to 1)
+            add("UTF-16" to 2)
+            add("HEX" to 3)
+        }
     }
 
     Column(Modifier.fillMaxWidth()) {
@@ -112,7 +142,7 @@ fun BodyPanel(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.weight(1f)
             )
-            if (isBinary && body.isNotEmpty() && mode == 0) {
+            if (isBinary && body.isNotEmpty() && effMode == 0) {
                 Text(
                     "导出",
                     fontSize = 12.sp,
@@ -129,14 +159,15 @@ fun BodyPanel(
                         .padding(horizontal = 4.dp)
                 )
             }
-            if (displayBody != null && displayBody.isNotEmpty()) {
+            actionSlot?.invoke()
+            if (copyText != null && copyText.isNotEmpty()) {
                 Text(
                     "复制",
                     fontSize = 12.sp,
                     color = StreamColors.Blue,
                     modifier = Modifier
                         .clickable {
-                            clipboard.setText(AnnotatedString(displayBody))
+                            clipboard.setText(AnnotatedString(copyText))
                             Toast.makeText(context, "Body 已复制", Toast.LENGTH_SHORT).show()
                         }
                         .padding(horizontal = 4.dp)
@@ -148,21 +179,21 @@ fun BodyPanel(
         if (!decompressFailed && body.isNotEmpty()) {
             Spacer(Modifier.height(6.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
-                listOf("文本" to 0, "UTF-16" to 1, "HEX" to 2).forEachIndexed { i, (label, m) ->
+                viewChips.forEachIndexed { i, (label, m) ->
                     if (i > 0) Spacer(Modifier.width(6.dp))
                     Text(
                         label,
                         fontSize = 11.sp,
-                        color = if (mode == m) Color.White else StreamColors.SubText,
-                        fontWeight = if (mode == m) FontWeight.SemiBold else FontWeight.Normal,
+                        color = if (effMode == m) Color.White else StreamColors.SubText,
+                        fontWeight = if (effMode == m) FontWeight.SemiBold else FontWeight.Normal,
                         modifier = Modifier
                             .background(
-                                if (mode == m) StreamColors.Blue else Color(0xFFF2F2F7),
+                                if (effMode == m) StreamColors.Blue else Color(0xFFF2F2F7),
                                 RoundedCornerShape(6.dp)
                             )
                             .clickable {
-                                mode = m
-                                if (m != 0) query = ""
+                                modeSel = m
+                                if (m != 0 && m != 1) query = ""
                             }
                             .padding(horizontal = 10.dp, vertical = 4.dp)
                     )
@@ -180,7 +211,7 @@ fun BodyPanel(
             }
         }
 
-        if (searchable && mode == 0 && displayBody != null && displayBody.isNotEmpty()) {
+        if (searchVisible) {
             Spacer(Modifier.height(6.dp))
             Row(
                 Modifier
@@ -217,15 +248,27 @@ fun BodyPanel(
             }
         }
 
-        Spacer(Modifier.height(4.dp))
-        SelectionContainer {
-            Text(
-                shownText ?: AnnotatedString(if (body.isEmpty()) "（空）" else ""),
-                fontSize = 12.sp,
-                fontFamily = FontFamily.Monospace,
-                color = if (isBinary && mode == 0 && shownText == null) Color(0xFF9E9E9E) else Color.Unspecified,
-                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
-            )
+        if (effMode == 1 && jsonRoot != null) {
+            Spacer(Modifier.height(6.dp))
+            JsonTreeView(jsonRoot, query = query)
+        } else {
+            Spacer(Modifier.height(4.dp))
+            if (jsonTooLarge) {
+                Text(
+                    "JSON 体积过大，已用文本展示（树形视图仅支持 ${formatBytes(400_000L)} 以内）",
+                    fontSize = 10.sp, color = Color(0xFF9E9E9E), lineHeight = 13.sp
+                )
+                Spacer(Modifier.height(4.dp))
+            }
+            SelectionContainer {
+                Text(
+                    shownText ?: AnnotatedString(if (body.isEmpty()) "（空）" else ""),
+                    fontSize = 12.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = if (isBinary && effMode == 0 && shownText == null) Color(0xFF9E9E9E) else Color.Unspecified,
+                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+                )
+            }
         }
     }
 }

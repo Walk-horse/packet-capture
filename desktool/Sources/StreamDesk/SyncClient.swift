@@ -49,6 +49,7 @@ final class SyncClient: ObservableObject {
         var download: Int64 = 0
         var requests = 0
         var passthrough = 0
+        var startedAt: Int64 = 0
     }
 
     @Published var address: String
@@ -62,6 +63,8 @@ final class SyncClient: ObservableObject {
     @Published private(set) var devices: [UsbDevice] = []
     @Published private(set) var selectedSerial: String?
     @Published var needsPick = false
+    /// WS 推送是否已连接（实时增量通道；原轮询通道照常保留作为兜底）
+    @Published private(set) var wsConnected = false
 
     /// 本地最多保留条数（超出丢弃最旧的，与手机端 500 上限解耦）
     private let maxLocal = 2000
@@ -87,6 +90,7 @@ final class SyncClient: ObservableObject {
 
     func saveAddress() {
         UserDefaults.standard.set(address, forKey: Key.address)
+        connectWs()
     }
 
     func setAutoSync(_ on: Bool) {
@@ -94,6 +98,7 @@ final class SyncClient: ObservableObject {
         UserDefaults.standard.set(on, forKey: Key.autoSync)
         schedule()
         if on { Task { await pull() } }
+        connectWs()
     }
 
     func setInterval(_ value: Double) {
@@ -225,6 +230,7 @@ final class SyncClient: ObservableObject {
     func startIfNeeded() {
         if exchanges.isEmpty { Task { await pull() } }
         schedule()
+        connectWs()
     }
 
     // MARK: - 同步
@@ -260,6 +266,109 @@ final class SyncClient: ObservableObject {
         lastId = nil
         ids.removeAll()
         await pull(full: true)
+        connectWs()
+    }
+
+    // MARK: - 移动端主动推送（WebSocket）
+
+    private var wsTask: URLSessionWebSocketTask?
+    private var wsRetry: Task<Void, Never>?
+
+    /// 连接手机端 WS 推送通道（ws://<addr>/api/ws）。
+    /// 原 HTTP 轮询通道保持不变，WS 仅作为实时增量补充；断线自动重连。
+    func connectWs() {
+        wsTask?.cancel(with: .goingAway, reason: nil)
+        wsTask = nil
+        guard let url = wsURL() else { return }
+        let task = URLSession.shared.webSocketTask(with: url)
+        wsTask = task
+        task.resume()
+        receiveWs(task)
+    }
+
+    private func wsURL() -> URL? {
+        var base = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !base.isEmpty else { return nil }
+        if !base.hasPrefix("http://"), !base.hasPrefix("https://") { base = "http://" + base }
+        base = base.replacingOccurrences(of: "/api/state", with: "")
+        while base.hasSuffix("/") { base.removeLast() }
+        guard let u = URL(string: base) else { return nil }
+        // http(s) -> ws(s)
+        let scheme = u.scheme == "https" ? "wss" : "ws"
+        var comps = URLComponents(url: u, resolvingAgainstBaseURL: false)
+        comps?.scheme = scheme
+        return comps?.url?.appendingPathComponent("api/ws")
+    }
+
+    private func receiveWs(_ task: URLSessionWebSocketTask) {
+        task.receive { [weak self] result in
+            Task { @MainActor in
+                guard let self else { return }
+                switch result {
+                case .failure:
+                    self.wsConnected = false
+                    self.scheduleWsRetry()
+                case .success(let msg):
+                    if case .string(let text) = msg {
+                        self.handleWsText(text)
+                    }
+                    self.receiveWs(task)
+                }
+            }
+        }
+    }
+
+    private func handleWsText(_ text: String) {
+        guard let data = text.data(using: .utf8),
+              let msg = try? JSONDecoder().decode(WsMessage.self, from: data) else { return }
+        Task { @MainActor in
+            self.applyWs(msg)
+            self.wsConnected = true
+            self.status = .ok(Date())
+        }
+    }
+
+    private func scheduleWsRetry() {
+        wsRetry?.cancel()
+        wsRetry = Task {
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard !Task.isCancelled else { return }
+            await MainActor.run { self.connectWs() }
+        }
+    }
+
+    /// 应用 WS 消息：snapshot 整体替换，delta 增量并入（去重）
+    private func applyWs(_ msg: WsMessage) {
+        stats = Stats(
+            capturing: msg.capturing,
+            upload: msg.uploadBytes,
+            download: msg.downloadBytes,
+            requests: msg.requestCount,
+            passthrough: msg.passthroughCount,
+            startedAt: msg.startedAt
+        )
+        if msg.type == "snapshot" {
+            exchanges = msg.exchanges
+            ids = Set(msg.exchanges.map(\.id))
+            passthrough = msg.passthrough
+        } else {
+            let fresh = msg.exchanges.filter { !ids.contains($0.id) }
+            if !fresh.isEmpty {
+                exchanges.insert(contentsOf: fresh, at: 0)
+                fresh.forEach { ids.insert($0.id) }
+            }
+            let passIds = Set(passthrough.map(\.id))
+            let freshPass = msg.passthrough.filter { !passIds.contains($0.id) }
+            if !freshPass.isEmpty {
+                passthrough.insert(contentsOf: freshPass, at: 0)
+            }
+        }
+        if exchanges.count > maxLocal {
+            let dropped = exchanges[maxLocal...]
+            dropped.forEach { ids.remove($0.id) }
+            exchanges = Array(exchanges.prefix(maxLocal))
+        }
+        lastId = exchanges.first?.id
     }
 
     func clearLocal() {
@@ -280,7 +389,8 @@ final class SyncClient: ObservableObject {
             upload: s.uploadBytes,
             download: s.downloadBytes,
             requests: s.requestCount,
-            passthrough: s.passthroughCount
+            passthrough: s.passthroughCount,
+            startedAt: s.startedAt
         )
         sessions = s.sessions
         passthrough = s.passthrough

@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -31,18 +32,30 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowDownward
+import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.activity.compose.BackHandler
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -61,9 +74,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.delay
 import com.ht.stream.data.HttpExchange
 import com.ht.stream.data.PassthroughRec
 import com.ht.stream.data.RequestStore
+import com.ht.stream.capture.CaptureVpnService
+import com.ht.stream.Screen
 
 /** 二级页类型：域名明细 / 进程明细 / 透传域名明细 */
 private sealed interface Sub {
@@ -431,15 +447,18 @@ private class AppInfoResolver(private val ctx: Context) {
 
     fun info(uid: Int): AppInfo {
         cache.get(uid)?.let { return it }
-        val resolved = if (uid >= 0) {
-            runCatching {
-                val pkg = pm.getPackagesForUid(uid)?.firstOrNull()
-                pkg?.let { it to pm.getApplicationInfo(it, 0) }
-            }.getOrNull()
+        // uid < 10000 是系统进程（android/system、systemui 等共享 uid 1000），
+        // 用 getPackagesForUid 会随机命中某个系统包名，反而误导，故直接标为系统进程。
+        // 先拿包名（getPackagesForUid 已按可见性过滤）；再取 ApplicationInfo。
+        // 两步分开：Android 11+ 包可见性可能让 getApplicationInfo 抛 NameNotFoundException，
+        // 但此时包名仍有价值，故回退为显示包名而不是 "UID xxx"。
+        val pkg = if (uid >= 10000) {
+            runCatching { pm.getPackagesForUid(uid)?.firstOrNull() }.getOrNull()
         } else null
-        val (pkg, app) = resolved ?: (null to null)
+        val app = pkg?.let { runCatching { pm.getApplicationInfo(it, 0) }.getOrNull() }
         val label = when {
             app != null -> app.loadLabel(pm).toString()
+            pkg != null -> pkg
             uid == 0 -> "Root"
             uid < 0 -> "未知进程"
             uid < 10000 -> "系统进程 (uid $uid)"
@@ -709,4 +728,332 @@ fun statusColor(code: Int): Color = when {
     code in 400..499 -> Color(0xFFEF6C00)
     code >= 500 -> Color(0xFFC62828)
     else -> Color(0xFF546E7A)
+}
+
+/**
+ * 二级抓包页：开始/停止按钮 + 实时计时 + 状态数据（上行/下行/请求/透传）
+ * + 实时请求列表（复用历史详情页的请求行与 tabs）。
+ */
+@Composable
+fun CaptureScreen(
+    running: Boolean,
+    onToggle: () -> Unit,
+    onBack: () -> Unit,
+    nav: (Screen) -> Unit
+) {
+    val startedAt by CaptureVpnService.startedAt.collectAsState()
+    var nowTick by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(running) {
+        while (true) {
+            nowTick = System.currentTimeMillis()
+            delay(1000)
+        }
+    }
+    val all by RequestStore.exchanges.collectAsState()
+    RequestStore.tick.collectAsState()
+    var tab by remember { mutableIntStateOf(0) }
+    var filter by remember { mutableStateOf("") }
+    var typeSel by remember { mutableStateOf(ReqType.ALL) }
+    var filterOpen by remember { mutableStateOf(false) }
+    var sub by remember { mutableStateOf<Sub?>(null) }
+    var showEndDialog by remember { mutableStateOf(false) }
+    // 进入抓包页即视为新抓包会话：隐藏进入前已有的记录，列表初始为空
+    var clearedIds by remember { mutableStateOf(RequestStore.exchanges.value.map { it.id }.toSet()) }
+    val listState = rememberLazyListState()
+    LaunchedEffect(tab, typeSel, sub) { listState.scrollToItem(0) }
+    val ctx = LocalContext.current
+    val appInfo = remember(ctx) { AppInfoResolver(ctx.applicationContext) }
+    val onOpen: (HttpExchange) -> Unit = { nav(Screen.Detail(it.id)) }
+
+    val handleBack: () -> Unit = {
+        if (running) showEndDialog = true else onBack()
+    }
+    BackHandler(enabled = true) { handleBack() }
+
+    val base = all
+    // 当前会话可见记录（进入页面时之前的历史被隐藏）
+    val visible = remember(base, clearedIds) { base.filter { it.id !in clearedIds } }
+    // 过滤条件仅作用于「全部请求」tab
+    val filtered = remember(visible, filter, typeSel) {
+        visible.filter { e ->
+            (filter.isBlank() ||
+                e.host.contains(filter, true) || e.path.contains(filter, true) || e.method.contains(filter, true)) &&
+                (typeSel == ReqType.ALL || classifyType(e) == typeSel)
+        }
+    }
+    val allPass by RequestStore.passthrough.collectAsState()
+    val basePass = allPass
+
+    // 抓包中：新记录到达时自动定位到最顶部（新记录插在列表头部）
+    val newestId = visible.firstOrNull()?.id
+    LaunchedEffect(newestId, running) {
+        if (running && visible.isNotEmpty()) listState.animateScrollToItem(0)
+    }
+
+    val up = RequestStore.uploadBytes.get()
+    val down = RequestStore.downloadBytes.get()
+    val elapsedText = if (running && startedAt > 0) formatCaptureElapsed(nowTick - startedAt) else null
+
+    Column(Modifier.fillMaxSize().background(StreamColors.BgGray)) {
+        StreamTopBar(
+            title = if (running) "正在抓包" else "抓包",
+            onBack = handleBack,
+            backLabel = "总览",
+            actions = {
+                IconButton(onClick = { clearedIds = all.map { it.id }.toSet() }) {
+                    Icon(Icons.Filled.Delete, contentDescription = "清除", tint = Color.White)
+                }
+            }
+        )
+
+        // 控制卡：小按钮 + 上行/下行（图标）+ 计时（右侧）
+        Card(
+            Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+            shape = RoundedCornerShape(12.dp),
+            colors = CardDefaults.cardColors(containerColor = Color.White),
+            elevation = CardDefaults.cardElevation(2.dp)
+        ) {
+            Row(
+                Modifier.fillMaxWidth().padding(10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(
+                    onClick = onToggle,
+                    modifier = Modifier.height(34.dp),
+                    shape = RoundedCornerShape(6.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 2.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (running) Color(0xFF34C759) else StreamColors.Orange
+                    )
+                ) {
+                    Text(if (running) "停止" else "开始", fontSize = 14.sp)
+                }
+                Spacer(Modifier.width(10.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Filled.ArrowUpward, contentDescription = "上行", tint = StreamColors.SubText, modifier = Modifier.size(14.dp))
+                    Spacer(Modifier.width(3.dp))
+                    Text(formatBytes(up), fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                }
+                Spacer(Modifier.width(10.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Filled.ArrowDownward, contentDescription = "下行", tint = StreamColors.SubText, modifier = Modifier.size(14.dp))
+                    Spacer(Modifier.width(3.dp))
+                    Text(formatBytes(down), fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                }
+                Spacer(Modifier.weight(1f))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Filled.Schedule, contentDescription = "计时", tint = StreamColors.SubText, modifier = Modifier.size(14.dp))
+                    Spacer(Modifier.width(3.dp))
+                    Text(elapsedText ?: "—", fontSize = 12.sp, fontWeight = FontWeight.Medium, fontFamily = FontFamily.Monospace)
+                }
+            }
+        }
+
+        val cur = sub
+        when (cur) {
+            is Sub.Domain -> {
+                val rows = remember(base, cur, typeSel) {
+                    base.filter { it.host == cur.host && (typeSel == ReqType.ALL || classifyType(it) == typeSel) }
+                }
+                ExchangeDetailList(rows, "该域名暂无请求", listState, onOpen, typeSel, { typeSel = it })
+            }
+            is Sub.Process -> {
+                val rows = remember(base, cur, typeSel) {
+                    base.filter { it.uid == cur.uid && (typeSel == ReqType.ALL || classifyType(it) == typeSel) }
+                }
+                ExchangeDetailList(rows, "该进程暂无请求", listState, onOpen, typeSel, { typeSel = it })
+            }
+            is Sub.PassHost -> {
+                val rows = remember(basePass, cur) { basePass.filter { it.host == cur.host } }
+                PassthroughDetailList(rows, "该域名暂无未解密连接", listState)
+            }
+            null -> {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    CompactTabs(
+                        items = listOf("全部请求", "按域名", "透传"),
+                        selected = tab,
+                        onSelect = {
+                            tab = it
+                            if (it != 0) filterOpen = false
+                        }
+                    )
+                }
+
+                // 请求数行：左侧统计文案，最右侧过滤图标；点击展开/收起过滤条件（仅「全部请求」）
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(start = 12.dp, end = 6.dp, top = 2.dp, bottom = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        when (tab) {
+                            1 -> "共 ${visible.groupBy { it.host }.size} 个域名 · ${visible.size} 个请求"
+                            2 -> "共 ${basePass.size} 条未解密连接"
+                            else -> "共 ${filtered.size} 个请求"
+                        },
+                        fontSize = 12.sp,
+                        color = StreamColors.SubText,
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (tab == 0) {
+                        IconButton(
+                            onClick = { filterOpen = !filterOpen },
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(
+                                if (filterOpen) Icons.Default.Close else Icons.Default.Search,
+                                contentDescription = "过滤",
+                                tint = if (filterOpen || filter.isNotEmpty() || typeSel != ReqType.ALL) StreamColors.Blue else StreamColors.SubText,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+                }
+
+                // 展开的过滤条件（仅「全部请求」）：输入框按接口名 + 类型过滤
+                if (tab == 0 && filterOpen) {
+                    Column(Modifier.fillMaxWidth().background(Color.White)) {
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 10.dp, vertical = 6.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(Color(0xFFF0F1F3))
+                                .padding(horizontal = 10.dp, vertical = 0.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                Icons.Default.Search, contentDescription = null,
+                                tint = StreamColors.SubText, modifier = Modifier.size(15.dp)
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            BasicTextField(
+                                value = filter,
+                                onValueChange = { filter = it },
+                                modifier = Modifier.weight(1f).padding(vertical = 6.dp),
+                                singleLine = true,
+                                textStyle = TextStyle(fontSize = 13.sp, color = Color(0xFF1A1A1A)),
+                                cursorBrush = SolidColor(StreamColors.Blue),
+                                decorationBox = { inner ->
+                                    if (filter.isEmpty()) {
+                                        Text("按接口名 / host / path 过滤", fontSize = 13.sp, color = StreamColors.SubText)
+                                    }
+                                    inner()
+                                }
+                            )
+                            if (filter.isNotEmpty()) {
+                                Icon(
+                                    Icons.Default.Close, contentDescription = "清空", tint = StreamColors.SubText,
+                                    modifier = Modifier.size(16.dp).clickable { filter = "" }
+                                )
+                            }
+                        }
+                        TypeFilterRow(typeSel) { typeSel = it }
+                    }
+                }
+
+                LazyColumn(
+                    Modifier.fillMaxSize().background(Color.White),
+                    state = listState,
+                    contentPadding = PaddingValues(bottom = 16.dp)
+                ) {
+                    when (tab) {
+                        0 -> {
+                            // 全部请求：平铺（应用过滤条件）
+                            if (filtered.isEmpty()) {
+                                item { EmptyHint(captureEmptyText(all, clearedIds)) }
+                            } else {
+                                items(filtered, key = { it.id }) { e ->
+                                    ExchangeRow(e) { onOpen(e) }
+                                }
+                            }
+                        }
+                        1 -> {
+                            // 按域名：域名聚合 → 二级为请求明细（不受过滤条件影响）
+                            if (visible.isEmpty()) {
+                                item { EmptyHint(captureEmptyText(all, clearedIds)) }
+                            } else {
+                                val hosts = visible.groupBy { it.host }.toList()
+                                    .sortedByDescending { it.second.size }
+                                items(hosts, key = { "host_${it.first}" }) { (h, list) ->
+                                    DomainRow(
+                                        host = h,
+                                        count = list.size,
+                                        downBytes = list.sumOf { it.responseBody.size.toLong() },
+                                        onClick = { sub = Sub.Domain(h) }
+                                    )
+                                }
+                            }
+                        }
+                        else -> {
+                            // 透传：按域名聚合（未解密连接）
+                            if (basePass.isEmpty()) {
+                                item {
+                                    Text(
+                                        "暂无未解密连接（App 拒绝证书 / 抓包模式排除 / 非 HTTP 流量 时会在此记录域名层元数据）",
+                                        fontSize = 12.sp,
+                                        color = StreamColors.SubText,
+                                        lineHeight = 18.sp,
+                                        modifier = Modifier.padding(16.dp)
+                                    )
+                                }
+                            } else {
+                                val hosts = basePass.groupBy { it.host }.toList()
+                                    .sortedByDescending { it.second.size }
+                                items(hosts, key = { "ph_${it.first}" }) { (h, list) ->
+                                    DomainPassRow(
+                                        host = h,
+                                        count = list.size,
+                                        down = list.sumOf { it.downBytes.get() },
+                                        up = list.sumOf { it.upBytes.get() },
+                                        onClick = { sub = Sub.PassHost(h) }
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (showEndDialog) {
+        AlertDialog(
+            onDismissRequest = { showEndDialog = false },
+            title = { Text("结束抓包") },
+            text = { Text("抓包仍在进行，是否结束抓包并返回上一页？") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showEndDialog = false
+                    onToggle()
+                    onBack()
+                }) { Text("结束抓包", color = StreamColors.RedText) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showEndDialog = false }) { Text("取消") }
+            }
+        )
+    }
+}
+
+private fun formatCaptureElapsed(ms: Long): String {
+    val totalSec = (ms / 1000).coerceAtLeast(0)
+    val h = totalSec / 3600
+    val m = totalSec % 3600 / 60
+    val s = totalSec % 60
+    return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%02d:%02d".format(m, s)
+}
+
+/**
+ * 抓包页列表为空时的提示文案：
+ * - 进入抓包页默认隐藏历史，仅展示本次新记录；列表为空时说明历史已保留。
+ * - 无任何记录时显示「暂无请求」。
+ */
+private fun captureEmptyText(all: List<HttpExchange>, clearedIds: Set<String>): String {
+    val hasHiddenHistory = all.any { it.id in clearedIds }
+    return if (hasHiddenHistory) "抓包历史已保留，本次新记录将显示在此" else "暂无请求"
 }

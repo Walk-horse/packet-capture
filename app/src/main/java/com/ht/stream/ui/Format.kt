@@ -12,15 +12,13 @@ import java.util.Locale
 import java.util.zip.GZIPInputStream
 import java.util.zip.InflaterInputStream
 
-/** 资源类型分类（仿 DevTools Network 面板） */
+/** 资源类型分类 */
 enum class ReqType(val label: String) {
     ALL("全部"),
-    XHR("Fetch/XHR"),
     DOC("文档"),
-    CSS("CSS"),
-    JS("JS"),
     IMG("图片"),
-    WASM("Wasm"),
+    CSSJS("css/js"),
+    WASM("wasm"),
     OTHER("其他");
 
     companion object {
@@ -31,7 +29,7 @@ enum class ReqType(val label: String) {
 
 /**
  * 按 Content-Type（响应优先）归类资源类型，缺失/不明确时按 path 扩展名兜底。
- * 抓包层无法感知页面发起类型（fetch/xhr/document），JSON/XML/表单等 API 响应归为 Fetch/XHR。
+ * 仅保留 文档 / 图片 / css-js / wasm / 其他 五类；JSON/XML/表单等 API 响应归入「其他」。
  */
 fun classifyType(e: HttpExchange): ReqType {
     val ct = (e.responseContentType ?: e.requestContentType ?: "")
@@ -41,13 +39,10 @@ fun classifyType(e: HttpExchange): ReqType {
     return when {
         ct.startsWith("image/") -> ReqType.IMG
         ct.startsWith("application/wasm") -> ReqType.WASM
-        ct == "text/css" -> ReqType.CSS
-        ct.contains("javascript") || ct.contains("ecmascript") || ct.contains("x-javascript") -> ReqType.JS
+        ct == "text/css" -> ReqType.CSSJS
+        ct.contains("javascript") || ct.contains("ecmascript") || ct.contains("x-javascript") -> ReqType.CSSJS
         ct.contains("html") || ct == "application/xhtml+xml" -> ReqType.DOC
-        ct.contains("json") || ct.contains("xml") || ct.contains("x-www-form-urlencoded") ||
-            ct.contains("multipart/form-data") -> ReqType.XHR
-        hasExt(".css") -> ReqType.CSS
-        hasExt(".js", ".mjs", ".cjs") -> ReqType.JS
+        hasExt(".css", ".js", ".mjs", ".cjs") -> ReqType.CSSJS
         hasExt(".html", ".htm") -> ReqType.DOC
         hasExt(".wasm") -> ReqType.WASM
         hasExt(".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp", ".avif", ".heic", ".webp") -> ReqType.IMG
@@ -194,7 +189,30 @@ fun bodyToText(bytes: ByteArray, contentType: String?, limit: Int = Int.MAX_VALU
     if (!textualHint) return null
     if (bytes.contains(0x00.toByte())) return null // NUL 字节 → 几乎不可能是文本
     val s = String(bytes, 0, minOf(bytes.size, limit), Charsets.UTF_8)
+    if (!looksLikeUtf8Text(s)) return null // 声称文本、实为高熵二进制（加密/压缩）→ 按二进制处理
     return if (bytes.size > limit) "$s\n\n…[截断，共 ${formatSize(bytes.size)}]" else s
+}
+
+/**
+ * UTF-8 解码结果是否像真实文本。
+ * 有些接口 Content-Type 写 application/json，实际 body 是加密/压缩后的二进制，
+ * 强行按 UTF-8 解码会产出大量替换字符（U+FFFD）与控制字符 —— 这类结果拿去展示、
+ * 导出 HAR 或拼 curl --data-raw 都是废的，直接判定为二进制更诚实。
+ * 阈值：替换字符 ≤2%、控制字符 ≤5%（各留 1 个容差，避免截断在多字节字符中间时误判）。
+ */
+private fun looksLikeUtf8Text(s: String): Boolean {
+    if (s.isEmpty()) return true
+    val n = minOf(s.length, 8192)
+    var bad = 0
+    var ctrl = 0
+    for (i in 0 until n) {
+        val c = s[i]
+        when {
+            c == '\uFFFD' -> bad++
+            c < ' ' && c != '\t' && c != '\n' && c != '\r' -> ctrl++
+        }
+    }
+    return bad <= n / 50 + 1 && ctrl <= n / 20 + 1
 }
 
 /** UTF-16 解码查看（自动处理 BOM / 大小端） */
@@ -301,7 +319,8 @@ private fun prettyJsonInto(r: JsonReader, sb: StringBuilder, depth: Int) {
     }
 }
 
-private fun quoteJson(s: String): String {
+/** JSON 字符串字面量化（含转义），供美化输出与 JSON 树展示复用 */
+internal fun quoteJson(s: String): String {
     val sb = StringBuilder(s.length + 16)
     sb.append('"')
     for (c in s) {
@@ -339,6 +358,16 @@ fun buildCurl(e: HttpExchange): String {
             !bodyText.startsWith("[二进制") && !bodyText.startsWith("[无法")
         ) {
             sb.append(" \\\n  --data-raw '${bodyText.replace("'", "'\\''")}'")
+        } else {
+            // 二进制 / 无法解码的请求体没法内联进命令行，加一行注释说明（放在首行，
+            // 保证注释之后仍是完整可粘贴执行的命令），避免剪贴板里的 curl 悄悄丢 body。
+            val note = buildString {
+                append("# 请求体为二进制或无法解码（")
+                append(formatSize(e.requestBody.size))
+                e.requestContentType?.takeIf { it.isNotBlank() }?.let { append("，$it") }
+                append("），已省略；如需重放请改用 --data-binary @body.bin\n")
+            }
+            sb.insert(0, note)
         }
     }
     return sb.toString()
