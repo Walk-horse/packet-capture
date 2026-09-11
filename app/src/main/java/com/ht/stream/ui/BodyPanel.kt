@@ -57,7 +57,9 @@ fun BodyPanel(
     contentEncoding: String?,
     searchable: Boolean,
     fileName: String,
-    fallback: String? = null
+    fallback: String? = null,
+    // 额外的头部动作（如请求页的「cURL」），渲染在「复制」按钮左侧
+    actionSlot: (@Composable () -> Unit)? = null
 ) {
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
@@ -157,6 +159,7 @@ fun BodyPanel(
                         .padding(horizontal = 4.dp)
                 )
             }
+            actionSlot?.invoke()
             if (copyText != null && copyText.isNotEmpty()) {
                 Text(
                     "复制",

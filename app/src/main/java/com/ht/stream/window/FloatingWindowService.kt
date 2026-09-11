@@ -69,6 +69,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -92,6 +94,7 @@ import com.ht.stream.data.RequestStore
 import com.ht.stream.ui.BodyPanel
 import com.ht.stream.ui.StreamColors
 import com.ht.stream.ui.StreamTheme
+import com.ht.stream.ui.buildCurl
 import com.ht.stream.ui.formatDuration
 import com.ht.stream.ui.formatFullTime
 import com.ht.stream.ui.formatSize
@@ -779,9 +782,45 @@ private fun PanelMessage(e: HttpExchange, request: Boolean) {
             contentType = if (request) e.requestContentType else e.responseContentType,
             contentEncoding = e.headerValue(headers, "Content-Encoding"),
             searchable = true,
-            fileName = fileName
+            fileName = fileName,
+            // 仅请求页：在「复制」左侧提供 cURL 复制
+            actionSlot = if (request) {
+                { CurlCopyAction(e) }
+            } else null
         )
     }
+}
+
+/**
+ * 请求页的「复制 cURL」按钮：放在 Body 头部「复制」左侧。
+ * 面板运行在后台服务里，Toast 可能被系统拦截，因此用按钮内联文字反馈。
+ */
+@Composable
+private fun CurlCopyAction(e: HttpExchange) {
+    val clipboard = LocalClipboardManager.current
+    var copied by remember(e) { mutableStateOf(false) }
+    LaunchedEffect(copied) {
+        if (copied) {
+            delay(1500)
+            copied = false
+        }
+    }
+    val accent = if (copied) Color(0xFF34C759) else StreamColors.Blue
+    Text(
+        if (copied) "已复制" else "cURL",
+        fontSize = 12.sp,
+        fontWeight = FontWeight.Medium,
+        color = accent,
+        modifier = Modifier
+            .padding(end = 6.dp)
+            .clip(RoundedCornerShape(4.dp))
+            .background(accent.copy(alpha = 0.12f))
+            .clickable {
+                clipboard.setText(AnnotatedString(buildCurl(e)))
+                copied = true
+            }
+            .padding(horizontal = 7.dp, vertical = 2.dp)
+    )
 }
 
 private val PanelBg = Color(0xFF121419)

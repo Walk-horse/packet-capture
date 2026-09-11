@@ -189,7 +189,30 @@ fun bodyToText(bytes: ByteArray, contentType: String?, limit: Int = Int.MAX_VALU
     if (!textualHint) return null
     if (bytes.contains(0x00.toByte())) return null // NUL 字节 → 几乎不可能是文本
     val s = String(bytes, 0, minOf(bytes.size, limit), Charsets.UTF_8)
+    if (!looksLikeUtf8Text(s)) return null // 声称文本、实为高熵二进制（加密/压缩）→ 按二进制处理
     return if (bytes.size > limit) "$s\n\n…[截断，共 ${formatSize(bytes.size)}]" else s
+}
+
+/**
+ * UTF-8 解码结果是否像真实文本。
+ * 有些接口 Content-Type 写 application/json，实际 body 是加密/压缩后的二进制，
+ * 强行按 UTF-8 解码会产出大量替换字符（U+FFFD）与控制字符 —— 这类结果拿去展示、
+ * 导出 HAR 或拼 curl --data-raw 都是废的，直接判定为二进制更诚实。
+ * 阈值：替换字符 ≤2%、控制字符 ≤5%（各留 1 个容差，避免截断在多字节字符中间时误判）。
+ */
+private fun looksLikeUtf8Text(s: String): Boolean {
+    if (s.isEmpty()) return true
+    val n = minOf(s.length, 8192)
+    var bad = 0
+    var ctrl = 0
+    for (i in 0 until n) {
+        val c = s[i]
+        when {
+            c == '\uFFFD' -> bad++
+            c < ' ' && c != '\t' && c != '\n' && c != '\r' -> ctrl++
+        }
+    }
+    return bad <= n / 50 + 1 && ctrl <= n / 20 + 1
 }
 
 /** UTF-16 解码查看（自动处理 BOM / 大小端） */
@@ -335,6 +358,16 @@ fun buildCurl(e: HttpExchange): String {
             !bodyText.startsWith("[二进制") && !bodyText.startsWith("[无法")
         ) {
             sb.append(" \\\n  --data-raw '${bodyText.replace("'", "'\\''")}'")
+        } else {
+            // 二进制 / 无法解码的请求体没法内联进命令行，加一行注释说明（放在首行，
+            // 保证注释之后仍是完整可粘贴执行的命令），避免剪贴板里的 curl 悄悄丢 body。
+            val note = buildString {
+                append("# 请求体为二进制或无法解码（")
+                append(formatSize(e.requestBody.size))
+                e.requestContentType?.takeIf { it.isNotBlank() }?.let { append("，$it") }
+                append("），已省略；如需重放请改用 --data-binary @body.bin\n")
+            }
+            sb.insert(0, note)
         }
     }
     return sb.toString()
