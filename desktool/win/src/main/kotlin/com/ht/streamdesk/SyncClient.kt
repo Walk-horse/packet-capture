@@ -17,6 +17,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -94,6 +96,7 @@ class SyncClient(
     private val ids = HashSet<String>()
     private var timerJob: Job? = null
     @Volatile private var inFlight = false
+    private val pullMutex = Mutex()
 
     private val decoder = Json { ignoreUnknownKeys = true; isLenient = true }
 
@@ -219,27 +222,30 @@ class SyncClient(
 
     // MARK: - 同步
 
-    /** 增量同步一次；full = true 时忽略游标，整体替换本地数据 */
+    /** 增量同步一次；full = true 时忽略游标，整体替换本地数据。
+     *  用 Mutex 串行化：并发的 pull 排队执行而不是静默丢弃（否则启动时
+     *  startIfNeeded 的增量 pull 会把紧随其后的 resetAndPull 全量请求吞掉）。 */
     suspend fun pull(full: Boolean = false) {
-        if (inFlight) return
-        val url = makeURL(full)
-        if (url == null) {
-            status.value = SyncStatus.Failed("请先在工具栏填写手机同步地址")
-            return
-        }
-        inFlight = true
-        status.value = SyncStatus.Syncing
-        try {
-            if (full) logd("pull 全量 url=$url")
-            val body = http(url)
-            val state = decoder.decodeFromString(SyncState.serializer(), body)
-            apply(state)
-            status.value = SyncStatus.Ok(System.currentTimeMillis())
-        } catch (e: Exception) {
-            logd("pull 失败: ${e.javaClass.simpleName}: ${e.message}")
-            status.value = SyncStatus.Failed(friendly(e))
-        } finally {
-            inFlight = false
+        pullMutex.withLock {
+            val url = makeURL(full)
+            if (url == null) {
+                status.value = SyncStatus.Failed("请先在工具栏填写手机同步地址")
+                return
+            }
+            inFlight = true
+            status.value = SyncStatus.Syncing
+            try {
+                if (full) logd("pull 全量 url=$url")
+                val body = http(url)
+                val state = decoder.decodeFromString(SyncState.serializer(), body)
+                apply(state)
+                status.value = SyncStatus.Ok(System.currentTimeMillis())
+            } catch (e: Exception) {
+                logd("pull 失败: ${e.javaClass.simpleName}: ${e.message}")
+                status.value = SyncStatus.Failed(friendly(e))
+            } finally {
+                inFlight = false
+            }
         }
     }
 

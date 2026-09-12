@@ -47,6 +47,9 @@ compose.desktop {
         // 本地运行时的 JVM 参数（Windows 上中文路径/字体无需额外处理）
         jvmArgs += listOf("-Dfile.encoding=UTF-8")
 
+        // macOS 上 gradlew run 的 Dock 图标（Window(icon=) 只管 Win/Linux；Windows 忽略 -Xdock）
+        jvmArgs += "-Xdock:icon=${rootProject.file("packaging/streamdesk-icon.png").absolutePath}"
+
         // macOS 上若 ~/.skiko 解压被系统拦截（Operation not permitted），
         // 可把 skiko dylib 预先解压到 .skiko-libs/，通过该参数跳过运行时解压；Windows 不受影响
         rootDir.resolve(".skiko-libs").takeIf { it.isDirectory }?.let {
@@ -61,7 +64,9 @@ compose.desktop {
             description = "Packet Capture 桌面同步面板"
             vendor = "ht.stream"
 
+            // 应用图标（Windows 打包时自动转 ico）
             windows {
+                iconFile.set(rootProject.file("packaging/streamdesk-icon.png"))
                 menu = true
                 shortcut = true
                 // 固定 UUID，保证后续版本可原地升级（不要随意更改）
