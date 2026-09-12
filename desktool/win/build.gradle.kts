@@ -47,8 +47,12 @@ compose.desktop {
         // 本地运行时的 JVM 参数（Windows 上中文路径/字体无需额外处理）
         jvmArgs += listOf("-Dfile.encoding=UTF-8")
 
-        // macOS 上 gradlew run 的 Dock 图标（Window(icon=) 只管 Win/Linux；Windows 忽略 -Xdock）
-        jvmArgs += "-Xdock:icon=${rootProject.file("packaging/streamdesk-icon.png").absolutePath}"
+        // macOS 上 gradlew run 的 Dock 图标。
+        // 注意：-Xdock:icon 是 macOS 专用参数，Windows/Linux 的 JVM 不识别会直接启动失败
+        //（实测 Windows JDK 报 Unrecognized option），必须按平台条件添加
+        if (org.gradle.internal.os.OperatingSystem.current().isMacOsX) {
+            jvmArgs += "-Xdock:icon=${rootProject.file("packaging/streamdesk-icon.png").absolutePath}"
+        }
 
         // macOS 上若 ~/.skiko 解压被系统拦截（Operation not permitted），
         // 可把 skiko dylib 预先解压到 .skiko-libs/，通过该参数跳过运行时解压；Windows 不受影响
@@ -68,6 +72,8 @@ compose.desktop {
             windows {
                 iconFile.set(rootProject.file("packaging/streamdesk-icon.png"))
                 menu = true
+                // 不设置 menuGroup 时 jpackage 默认放「未知」文件夹，指定一个干净的分组名
+                menuGroup = "Packet Capture"
                 shortcut = true
                 // 固定 UUID，保证后续版本可原地升级（不要随意更改）
                 upgradeUuid = "6f3c1a54-8f2e-4b0d-9c47-2a5e7d1b8f30"

@@ -247,6 +247,12 @@ object SyncServer {
 
     /** 向所有 WS 客户端增量推送自上次以来的新增「已落定且未同步」请求 + 最新统计 */
     private fun broadcastDelta() {
+        // 关键：没有存活的 WS 客户端时直接返回，绝不能取数据。
+        // takeExchangesForSync(false) 会把未同步记录置为 synced=true，
+        // 而桌面端可能只走 HTTP 轮询（如 Windows 版从不连 WS）——
+        // 若在此处取走数据却没有客户端接收，新请求会被标记已同步后凭空丢弃，
+        // HTTP 增量轮询从此永远拉不到新数据（表现为桌面端清屏后不再同步）。
+        if (wsClients.none { it.alive }) return
         // 与 HTTP 增量共用 synced 标志位：取 settled && !synced 并置位，桌面端按 id 去重
         val send = RequestStore.takeExchangesForSync(false)
         if (send.isEmpty()) return
