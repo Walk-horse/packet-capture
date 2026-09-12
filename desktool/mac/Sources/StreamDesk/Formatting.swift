@@ -134,7 +134,7 @@ func curlCommand(for e: ExchangeRecord) -> String {
 
     let data = e.requestData
     if !data.isEmpty {
-        if let text = e.reqText ?? decodeText(data) {
+        if let text = decodeText(data) {
             cmd += " \\\n  --data-raw \(shellQuote(text))"
         } else {
             cmd += " \\\n  --data-binary @<文件路径>（二进制 body，请用「保存」导出后替换）"

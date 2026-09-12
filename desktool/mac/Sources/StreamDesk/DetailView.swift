@@ -117,7 +117,6 @@ struct DetailView: View {
             BodyView(
                 key: "\(e.id)-req-\(e.requestBodyB64.count)",
                 data: e.requestData,
-                phoneText: e.reqText,
                 encoding: e.reqEncoding,
                 contentType: e.reqType,
                 truncated: e.requestBodyTruncated
@@ -126,7 +125,6 @@ struct DetailView: View {
             BodyView(
                 key: "\(e.id)-resp-\(e.responseBodyB64.count)",
                 data: e.responseData,
-                phoneText: e.respText,
                 encoding: e.respEncoding,
                 contentType: e.respType,
                 truncated: e.responseBodyTruncated

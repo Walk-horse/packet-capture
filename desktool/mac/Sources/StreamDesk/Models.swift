@@ -85,9 +85,6 @@ struct ExchangeRecord: Decodable, Identifiable {
     let responseBodyTruncated: Bool
     let reqEncoding: String?
     let respEncoding: String?
-    /// 手机端已按 Content-Encoding 解压并识别编码后的可读文本（二进制为格式提示）
-    let reqText: String?
-    let respText: String?
 
     var startDate: Date { Date(timeIntervalSince1970: Double(startTime) / 1000) }
 

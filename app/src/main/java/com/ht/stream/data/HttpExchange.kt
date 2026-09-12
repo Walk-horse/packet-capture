@@ -32,6 +32,12 @@ class HttpExchange(
     /** 是否收藏 */
     var favorite: Boolean = false
 
+    /**
+     * 是否已同步到桌面端。默认 false（新建记录待同步）。
+     * 手机端在增量/全量同步下发该记录后置 true，之后自动同步只下发未同步部分。
+     */
+    @Volatile var synced: Boolean = false
+
     /** 实际连接的远端 IP */
     var remoteIp: String? = null
 

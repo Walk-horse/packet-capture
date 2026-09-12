@@ -24,10 +24,11 @@ import kotlinx.coroutines.launch
 /**
  * 桌面同步服务：手机端做 server，Mac 面板拉取 / 接收抓包数据。
  *
- *  - GET /api/state?after=<lastExchangeId>   同步快照（增量 / 全量兜底） —— 原轮询逻辑，保持不变
- *  - GET /api/ping                           探活
- *  - GET /                                   服务自检
- *  - GET /api/ws  (Upgrade: websocket)       移动端主动推送：连接时下发全量快照，之后数据变化即时增量推送
+ *  - GET /api/state?full=1   全量同步：返回全部请求（置已同步），客户端整体替换
+ *  - GET /api/state          增量同步：仅返回尚未同步(synced=false)的请求（下发后置已同步）
+ *  - GET /api/ping           探活
+ *  - GET /                   服务自检
+ *  - GET /api/ws  (Upgrade: websocket)       移动端主动推送：连接时下发未同步快照，之后数据变化即时增量推送
  *
  * 抓包开启时本机外发流量走 TUN，但服务接收的是局域网/USB 入站连接，不受 VPN 影响。
  */
@@ -170,8 +171,8 @@ object SyncServer {
                         code = 405
                     }
                     path == "/api/state" -> {
-                        val after = query["after"]?.takeIf { it.isNotBlank() }
-                        body = SyncJson.state(after).toString().toByteArray(Charsets.UTF_8)
+                        val full = query["full"] == "1"
+                        body = SyncJson.state(full).toString().toByteArray(Charsets.UTF_8)
                         code = 200
                     }
                     path == "/api/ping" -> {
@@ -220,10 +221,8 @@ object SyncServer {
         out.flush()
 
         val client = WsClient(sock, out)
-        // 下发全量快照
+        // 下发增量快照（仅尚未同步的「已落定」记录，并置已同步）
         runCatching {
-            client.lastEx = RequestStore.exchanges.value.firstOrNull()?.id
-            client.lastPass = RequestStore.passthrough.value.firstOrNull()?.id
             client.send(SyncJson.wsSnapshot().toString())
         }
         wsClients.add(client)
@@ -246,26 +245,20 @@ object SyncServer {
         }
     }
 
-    /** 向所有 WS 客户端增量推送自上次以来的新增请求 / 透传 + 最新统计 */
+    /** 向所有 WS 客户端增量推送自上次以来的新增「已落定且未同步」请求 + 最新统计 */
     private fun broadcastDelta() {
-        val topEx = RequestStore.exchanges.value.firstOrNull()?.id
-        val topPass = RequestStore.passthrough.value.firstOrNull()?.id
+        // 与 HTTP 增量共用 synced 标志位：取 settled && !synced 并置位，桌面端按 id 去重
+        val send = RequestStore.takeExchangesForSync(false)
+        if (send.isEmpty()) return
+        val json = runCatching { SyncJson.wsDelta(send).toString() }.getOrNull() ?: return
         val snapshot = synchronized(wsClients) { wsClients.toList() }
         for (client in snapshot) {
-            if (!client.alive) continue
-            val json = runCatching { SyncJson.wsDelta(client.lastEx, client.lastPass).toString() }.getOrNull() ?: continue
-            client.send(json)
-            if (client.alive) {
-                client.lastEx = topEx
-                client.lastPass = topPass
-            }
+            if (client.alive) client.send(json)
         }
     }
 
     private class WsClient(val socket: Socket, private val out: OutputStream) {
         @Volatile var alive = true
-        var lastEx: String? = null
-        var lastPass: String? = null
         private val lock = Any()
 
         fun send(text: String) {

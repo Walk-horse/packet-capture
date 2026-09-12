@@ -9,8 +9,22 @@ struct SyncConfigView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("同步设置")
-                .font(.headline)
+            HStack(alignment: .top) {
+                Text("同步设置")
+                    .font(.headline)
+                Spacer()
+                Button {
+                    dismiss()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .symbolRenderingMode(.hierarchical)
+                        .font(.title3)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("关闭")
+                .keyboardShortcut(.escape, modifiers: [])
+            }
 
             // 手机地址
             VStack(alignment: .leading, spacing: 6) {

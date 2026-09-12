@@ -33,5 +33,5 @@ Thumbs.db
 *.tmp
 
 # desktool（macOS 桌面面板）构建产物
-desktool/.build/
-desktool/dist/
+desktool/**/.build/
+desktool/**/dist/

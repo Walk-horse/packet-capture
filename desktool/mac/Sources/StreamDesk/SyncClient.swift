@@ -68,7 +68,6 @@ final class SyncClient: ObservableObject {
 
     /// 本地最多保留条数（超出丢弃最旧的，与手机端 500 上限解耦）
     private let maxLocal = 2000
-    private var lastId: String?
     private var ids: Set<String> = []
     private var timer: Timer?
     private var inFlight = false
@@ -253,7 +252,11 @@ final class SyncClient: ObservableObject {
             )
             request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
             let (data, _) = try await URLSession.shared.data(for: request)
-            let state = try JSONDecoder().decode(SyncState.self, from: data)
+            // 后台解码：数百条记录 × 大 body 的 payload 可能数 MB，主线程解码会冻结 UI、
+            // 让「同步中」长时间不结束，甚至触发 12s 超时误报失败
+            let state = try await Task.detached(priority: .userInitiated) {
+                try JSONDecoder().decode(SyncState.self, from: data)
+            }.value
             apply(state)
             status = .ok(Date())
         } catch {
@@ -261,9 +264,8 @@ final class SyncClient: ObservableObject {
         }
     }
 
-    /// 全量重新同步：清空游标与本地缓存后整体拉取（手机端清空历史后用它对齐）
+    /// 全量重新同步：清空本地缓存后整体拉取（手机端返回全部请求并置已同步）
     func resetAndPull() async {
-        lastId = nil
         ids.removeAll()
         await pull(full: true)
         connectWs()
@@ -319,12 +321,16 @@ final class SyncClient: ObservableObject {
     }
 
     private func handleWsText(_ text: String) {
-        guard let data = text.data(using: .utf8),
-              let msg = try? JSONDecoder().decode(WsMessage.self, from: data) else { return }
-        Task { @MainActor in
-            self.applyWs(msg)
-            self.wsConnected = true
-            self.status = .ok(Date())
+        // 后台解码后回主线程应用，避免大 payload 在 WS 回调里阻塞主线程（同 pull 的卡顿根因）
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let data = text.data(using: .utf8),
+                  let msg = try? JSONDecoder().decode(WsMessage.self, from: data) else { return }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.applyWs(msg)
+                self.wsConnected = true
+                self.status = .ok(Date())
+            }
         }
     }
 
@@ -337,7 +343,8 @@ final class SyncClient: ObservableObject {
         }
     }
 
-    /// 应用 WS 消息：snapshot 整体替换，delta 增量并入（去重）
+    /// 应用 WS 消息：snapshot 与 delta 统一按增量并入（按 id 去重）。
+    /// 手机端 snapshot 现在只发「尚未同步」的子集，不再整体替换，避免清屏/重连后误删本地已展示记录。
     private func applyWs(_ msg: WsMessage) {
         stats = Stats(
             capturing: msg.capturing,
@@ -347,36 +354,30 @@ final class SyncClient: ObservableObject {
             passthrough: msg.passthroughCount,
             startedAt: msg.startedAt
         )
-        if msg.type == "snapshot" {
-            exchanges = msg.exchanges
-            ids = Set(msg.exchanges.map(\.id))
-            passthrough = msg.passthrough
-        } else {
-            let fresh = msg.exchanges.filter { !ids.contains($0.id) }
-            if !fresh.isEmpty {
-                exchanges.insert(contentsOf: fresh, at: 0)
-                fresh.forEach { ids.insert($0.id) }
-            }
-            let passIds = Set(passthrough.map(\.id))
-            let freshPass = msg.passthrough.filter { !passIds.contains($0.id) }
-            if !freshPass.isEmpty {
-                passthrough.insert(contentsOf: freshPass, at: 0)
-            }
+        let fresh = msg.exchanges.filter { !ids.contains($0.id) }
+        if !fresh.isEmpty {
+            exchanges.insert(contentsOf: fresh, at: 0)
+            fresh.forEach { ids.insert($0.id) }
+        }
+        let passIds = Set(passthrough.map(\.id))
+        let freshPass = msg.passthrough.filter { !passIds.contains($0.id) }
+        if !freshPass.isEmpty {
+            passthrough.insert(contentsOf: freshPass, at: 0)
         }
         if exchanges.count > maxLocal {
             let dropped = exchanges[maxLocal...]
             dropped.forEach { ids.remove($0.id) }
             exchanges = Array(exchanges.prefix(maxLocal))
         }
-        lastId = exchanges.first?.id
     }
 
+    /// 仅清空本地显示，不改动手机端记录的 synced 标志位。
+    /// 因此清屏后手机端不会回退成全量：已同步的记录仍 synced=true，增量同步只下发此后新请求；
+    /// 若想重新看已同步的历史，点「全量重新同步」（发 ?full=1 让手机端回传全部）。
     func clearLocal() {
         exchanges = []
         sessions = []
         passthrough = []
-        ids.removeAll()
-        lastId = nil
         stats = Stats()
         status = .idle
     }
@@ -410,7 +411,6 @@ final class SyncClient: ObservableObject {
             dropped.forEach { ids.remove($0.id) }
             exchanges = Array(exchanges.prefix(maxLocal))
         }
-        lastId = exchanges.first?.id
     }
 
     private func makeURL(full: Bool) -> URL? {
@@ -423,10 +423,8 @@ final class SyncClient: ObservableObject {
         while base.hasSuffix("/") { base.removeLast() }
 
         var fullPath = base + "/api/state"
-        if !full, let id = lastId,
-           let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
-            fullPath += "?after=" + encoded
-        }
+        // full=1 时手机端返回全部请求（不管是否已同步）；否则只返回尚未同步的部分
+        if full { fullPath += "?full=1" }
         return URL(string: fullPath)
     }
 
