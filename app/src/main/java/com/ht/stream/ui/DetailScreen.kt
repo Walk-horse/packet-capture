@@ -213,6 +213,9 @@ private fun OverviewTab(e: HttpExchange) {
                 HttpExchange.State.FAILED -> "失败：${e.error ?: "-"}"
             })
             KVRow("请求时间", formatFullTime(e.startTime), mono = true)
+            if (e.mocked) {
+                KVRow("响应来源", if (e.mockAuto) "接口模拟（示例按响应类型自动生成）" else "接口模拟（自定义示例）")
+            }
         }
 
         SectionHeader("标识符")

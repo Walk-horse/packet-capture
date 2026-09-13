@@ -19,6 +19,8 @@ struct RequestListView: View {
             base = client.exchanges.filter { $0.host == host }
         case .passthrough:
             base = []
+        case .mock:
+            base = []
         }
         let q = search.trimmed
         let searched: [ExchangeRecord]
@@ -125,9 +127,20 @@ private struct ExchangeRowView: View {
                 .frame(width: 52)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(e.displayPath)
-                    .font(.system(size: 13))
-                    .lineLimit(2)
+                HStack(spacing: 4) {
+                    if e.isMocked {
+                        Text("模拟")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Color.purple, in: RoundedRectangle(cornerRadius: 3))
+                            .help(e.isMockAuto ? "接口模拟响应（示例按响应类型自动生成）" : "接口模拟响应（自定义示例）")
+                    }
+                    Text(e.displayPath)
+                        .font(.system(size: 13))
+                        .lineLimit(2)
+                }
                 Text(e.host)
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)

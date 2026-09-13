@@ -92,11 +92,13 @@ class SyncClient(
 
     /** 本地最多保留条数（超出丢弃最旧的，与手机端 500 上限解耦） */
     private val maxLocal = 2000
-    private var lastId: String? = null
     private val ids = HashSet<String>()
     private var timerJob: Job? = null
     @Volatile private var inFlight = false
     private val pullMutex = Mutex()
+    /** adb forward 自愈：上次重建时间（限频）+ 串行锁 */
+    private var lastHealAt = 0L
+    private val healMutex = Mutex()
 
     private val decoder = Json { ignoreUnknownKeys = true; isLenient = true }
 
@@ -119,9 +121,11 @@ class SyncClient(
         schedule()
     }
 
-    /** 启动自动同步（首次进入或地址变更后调用） */
+    /** 启动自动同步（首次进入或地址变更后调用）。
+     *  本地为空（首次启动/重启后内存态丢失）必须走全量：增量在手机端 synced 标志位协议下
+     *  多半回空（历史记录早已被消费），否则会出现「已连接、状态正常，但列表 0 条」。 */
     fun startIfNeeded() {
-        if (exchanges.value.isEmpty()) scope.launch { pull() }
+        scope.launch { pull(full = exchanges.value.isEmpty()) }
         schedule()
     }
 
@@ -240,18 +244,81 @@ class SyncClient(
                 val state = decoder.decodeFromString(SyncState.serializer(), body)
                 apply(state)
                 status.value = SyncStatus.Ok(System.currentTimeMillis())
+                logd("pull ${if (full) "全量" else "增量"} 成功: 本次 ${state.exchanges.size} 条, 累计 ${exchanges.value.size} 条")
             } catch (e: Exception) {
                 logd("pull 失败: ${e.javaClass.simpleName}: ${e.message}")
                 status.value = SyncStatus.Failed(friendly(e))
+                // 连不上多半是 adb forward 规则丢了（USB 断连不持久化）→ 自动重建并补拉一次。
+                // 补拉按「本地为空则全量」：失败的那次若是全量（空列表时的启动拉取），
+                // 补拉必须同样是全量，否则增量回空、列表依旧是 0 条。
+                if (selfHealForward()) {
+                    scope.launch { delay(300); pull(full = exchanges.value.isEmpty()) }
+                }
             } finally {
                 inFlight = false
             }
         }
     }
 
-    /** 全量重新同步：清空游标与本地缓存后整体拉取（手机端清空历史后用它对齐） */
+    // MARK: - adb forward 自愈
+
+    /**
+     * 连接失败时自动重建 adb forward，返回是否真的重建成功。
+     *
+     * 背景：`adb forward` 规则不跨 USB 断连持久化——手机插拔/锁屏重连后规则就丢了，
+     * 表现为「面板连不上手机」。地址是本机回环时，连不上几乎必然意味着规则丢失。
+     * 限频 8 秒，避免网络抖动时反复重建（重建会掐断已建立的 WS 连接）。
+     */
+    private suspend fun selfHealForward(): Boolean {
+        if (!isLoopbackHost(address.value)) return false
+        if (System.currentTimeMillis() - lastHealAt < 8_000) return false
+        return healMutex.withLock {
+            // 双重检查：等锁期间可能已被别的协程重建过
+            if (System.currentTimeMillis() - lastHealAt < 8_000) return@withLock false
+            lastHealAt = System.currentTimeMillis()
+            val adb = Adb.path()
+            val port = portOf(address.value)
+            if (adb == null || port == null) {
+                logd("[x] 无法自愈：adb=${adb ?: "未找到"} port=${port ?: "未解析"}")
+                return@withLock false
+            }
+            runCatching { Adb.run(listOf("forward", "--remove", "tcp:$port"), adb) }
+            val args = buildList {
+                selectedSerial.value?.let { add("-s"); add(it) }
+                add("forward"); add("tcp:$port"); add("tcp:17890")
+            }
+            runCatching { Adb.run(args, adb) }.fold(
+                onSuccess = {
+                    logd("[ok] 连接失败，已重建 adb forward tcp:$port -> tcp:17890")
+                    true
+                },
+                onFailure = {
+                    logd("[x] 重建 adb forward tcp:$port 失败: ${it.message}")
+                    false
+                },
+            )
+        }
+    }
+
+    private fun isLoopbackHost(addr: String): Boolean {
+        val host = addr.trim()
+            .removePrefix("http://").removePrefix("https://")
+            .replace("/api/state", "")
+            .substringBefore(":").lowercase()
+        return host == "127.0.0.1" || host == "localhost" || host == "::1"
+    }
+
+    private fun portOf(addr: String): Int? {
+        val s = addr.trim()
+            .removePrefix("http://").removePrefix("https://")
+            .replace("/api/state", "")
+        val parts = s.split(":")
+        if (parts.size < 2) return 17890
+        return parts[1].takeWhile { it.isDigit() }.toIntOrNull() ?: 17890
+    }
+
+    /** 全量重新同步：清空本地缓存后整体拉取（发 ?full=1，手机端回传全部并置已同步） */
     suspend fun resetAndPull() {
-        lastId = null
         ids.clear()
         pull(full = true)
     }
@@ -261,7 +328,6 @@ class SyncClient(
         sessions.value = emptyList()
         passthrough.value = emptyList()
         ids.clear()
-        lastId = null
         stats.value = Stats()
         status.value = SyncStatus.Idle
     }
@@ -273,7 +339,6 @@ class SyncClient(
     fun clearScreen() {
         exchanges.value = emptyList()
         ids.clear()
-        lastId = null
     }
 
     // MARK: - 内部
@@ -303,7 +368,6 @@ class SyncClient(
             list = list.take(maxLocal)
         }
         exchanges.value = list
-        lastId = list.firstOrNull()?.id
     }
 
     /** 地址规范化：允许粘贴完整 /api/state 地址或带尾斜杠 */

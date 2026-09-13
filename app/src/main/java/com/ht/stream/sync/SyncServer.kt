@@ -1,6 +1,7 @@
 package com.ht.stream.sync
 
 import android.content.Context
+import com.ht.stream.data.MockStore
 import com.ht.stream.data.RequestStore
 import java.io.OutputStream
 import java.net.Inet4Address
@@ -20,6 +21,9 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
+import org.json.JSONArray
+import org.json.JSONObject
+import org.json.JSONTokener
 
 /**
  * 桌面同步服务：手机端做 server，Mac 面板拉取 / 接收抓包数据。
@@ -27,6 +31,10 @@ import kotlinx.coroutines.launch
  *  - GET /api/state?full=1   全量同步：返回全部请求（置已同步），客户端整体替换
  *  - GET /api/state          增量同步：仅返回尚未同步(synced=false)的请求（下发后置已同步）
  *  - GET /api/ping           探活
+ *  - GET /api/mock           读取接口模拟配置（规则 + 按应用开关状态）
+ *  - POST /api/mock          下发接口模拟规则（整体覆盖），body 为 {"rules":[...]} 或裸数组
+ *  - POST /api/mock/apps     切换总开关 / 某应用开关，body {"master":bool,"enabled":[pkg,...]}
+ *  - POST /api/mock/clear    清除本机接口模拟配置（规则 + 应用开关 + 总开关）
  *  - GET /                   服务自检
  *  - GET /api/ws  (Upgrade: websocket)       移动端主动推送：连接时下发未同步快照，之后数据变化即时增量推送
  *
@@ -37,6 +45,13 @@ object SyncServer {
     const val DEFAULT_PORT = 17890
 
     private val runningFlag = AtomicBoolean(false)
+
+    /** 应用上下文（接口模拟配置读写需要）；由 MainActivity 启动时注入 */
+    @Volatile private var appContext: Context? = null
+
+    fun attach(context: Context) {
+        appContext = context.applicationContext
+    }
 
     @Volatile private var serverSocket: ServerSocket? = null
     @Volatile private var acceptThread: Thread? = null
@@ -134,21 +149,15 @@ object SyncServer {
         try {
             sock.use { s ->
                 s.soTimeout = 10_000
-                val reader = s.getInputStream().bufferedReader(Charsets.ISO_8859_1)
-                val requestLine = reader.readLine() ?: return
-                val parts = requestLine.split(" ")
+                val input = s.getInputStream()
+                val head = readHead(input) ?: return
+                val parts = head.startLine.split(" ")
                 if (parts.size < 2) return
-                val method = parts[0]
+                val method = parts[0].uppercase()
                 val rawPath = parts[1]
+                val headers = head.headers
 
-                // 收集请求头（用于判断 WebSocket Upgrade）
-                val headers = mutableListOf<String>()
-                while (true) {
-                    val line = reader.readLine() ?: break
-                    if (line.isEmpty()) break
-                    headers.add(line)
-                }
-
+                // WebSocket 升级（推送通道）
                 val isWs = headers.any { it.equals("upgrade: websocket", ignoreCase = true) }
                 if (isWs) {
                     val key = headers.firstNotNullOfOrNull { h ->
@@ -162,17 +171,49 @@ object SyncServer {
                     }
                 }
 
+                val reqBody = readBody(input, headers)
                 val (path, query) = splitPath(rawPath)
+                val ctx = appContext
+
                 val body: ByteArray
                 val code: Int
                 when {
+                    // 接口模拟：读取配置（规则 + 按应用开关）
+                    path == "/api/mock" && method == "GET" -> {
+                        body = mockConfigJson(ctx).toString().toByteArray(Charsets.UTF_8)
+                        code = 200
+                    }
+                    // 接口模拟：下发规则（整体覆盖）
+                    path == "/api/mock" && method == "POST" -> {
+                        val result = applyMockRules(ctx, reqBody)
+                        body = result.toString().toByteArray(Charsets.UTF_8)
+                        code = if (result.optBoolean("ok")) 200 else 400
+                    }
+                    // 接口模拟：桌面端也可切某应用的开关
+                    path == "/api/mock/apps" && method == "POST" -> {
+                        val result = applyMockApps(ctx, reqBody)
+                        body = result.toString().toByteArray(Charsets.UTF_8)
+                        code = if (result.optBoolean("ok")) 200 else 400
+                    }
+                    // 接口模拟：清除本机配置（规则 + 应用开关 + 总开关）
+                    path == "/api/mock/clear" && method == "POST" -> {
+                        val result = if (ctx == null) {
+                            JSONObject().put("ok", false).put("error", "app context 未注入")
+                        } else {
+                            MockStore.clearAll(ctx)
+                        }
+                        body = result.toString().toByteArray(Charsets.UTF_8)
+                        code = if (result.optBoolean("ok")) 200 else 400
+                    }
                     method != "GET" -> {
-                        body = "{\"error\":\"only GET supported\"}".toByteArray(Charsets.UTF_8)
+                        body = "{\"error\":\"unsupported method\"}".toByteArray(Charsets.UTF_8)
                         code = 405
                     }
                     path == "/api/state" -> {
                         val full = query["full"] == "1"
-                        body = SyncJson.state(full).toString().toByteArray(Charsets.UTF_8)
+                        val json = SyncJson.state(full)
+                        ctx?.let { json.put("mock", MockStore.status(it)) }
+                        body = json.toString().toByteArray(Charsets.UTF_8)
                         code = 200
                     }
                     path == "/api/ping" -> {
@@ -180,7 +221,7 @@ object SyncServer {
                         code = 200
                     }
                     path == "/" -> {
-                        body = "{\"name\":\"stream-sync\",\"api\":\"/api/state\"}".toByteArray(Charsets.UTF_8)
+                        body = "{\"name\":\"stream-sync\",\"api\":\"/api/state\",\"mock\":\"/api/mock\",\"mockClear\":\"/api/mock/clear\"}".toByteArray(Charsets.UTF_8)
                         code = 200
                     }
                     else -> {
@@ -189,20 +230,123 @@ object SyncServer {
                     }
                 }
 
-                val head = "HTTP/1.1 $code ${reason(code)}\r\n" +
+                val headOut = "HTTP/1.1 $code ${reason(code)}\r\n" +
                     "Content-Type: application/json; charset=utf-8\r\n" +
                     "Content-Length: ${body.size}\r\n" +
                     "Cache-Control: no-store\r\n" +
                     "Access-Control-Allow-Origin: *\r\n" +
                     "Connection: close\r\n\r\n"
                 val out = s.getOutputStream()
-                out.write(head.toByteArray(Charsets.UTF_8))
+                out.write(headOut.toByteArray(Charsets.UTF_8))
                 out.write(body)
                 out.flush()
             }
         } catch (e: Exception) {
             // 客户端断连等，忽略
         }
+    }
+
+    // ================= 接口模拟配置 =================
+
+    /** GET /api/mock：规则 + 各应用开关状态 */
+    private fun mockConfigJson(ctx: Context?): JSONObject {
+        if (ctx == null) return JSONObject().put("ok", false).put("error", "app context 未注入")
+        return JSONObject().apply {
+            put("ok", true)
+            put("enabled", MockStore.isEnabled(ctx))
+            put("rules", MockStore.rulesToJson(ctx))
+            put("enabledApps", JSONArray().apply { MockStore.enabledApps(ctx).forEach { put(it) } })
+            put("updatedAt", MockStore.rulesUpdatedAt(ctx))
+        }
+    }
+
+    /** POST /api/mock：body 可为 {"rules":[...]} 或裸数组，整体覆盖规则 */
+    private fun applyMockRules(ctx: Context?, payload: ByteArray): JSONObject {
+        if (ctx == null) return JSONObject().put("ok", false).put("error", "app context 未注入")
+        val text = String(payload, Charsets.UTF_8).trim()
+        if (text.isEmpty()) return JSONObject().put("ok", false).put("error", "请求体为空")
+        val array = runCatching {
+            when (val v = JSONTokener(text).nextValue()) {
+                is JSONArray -> v
+                is JSONObject -> v.optJSONArray("rules") ?: JSONArray()
+                else -> JSONArray()
+            }
+        }.getOrNull() ?: return JSONObject().put("ok", false).put("error", "JSON 解析失败")
+        val count = MockStore.setRulesJson(ctx, array.toString())
+        return JSONObject().apply {
+            put("ok", true)
+            put("count", count)
+            put("enabled", MockStore.isEnabled(ctx))
+        }
+    }
+
+    /** POST /api/mock/apps：body {"enabled":[pkg,...]} 或 {"enabled":true/false}（总开关） */
+    private fun applyMockApps(ctx: Context?, payload: ByteArray): JSONObject {
+        if (ctx == null) return JSONObject().put("ok", false).put("error", "app context 未注入")
+        val text = String(payload, Charsets.UTF_8).trim()
+        val obj = runCatching { JSONTokener(text).nextValue() as? JSONObject }.getOrNull()
+            ?: return JSONObject().put("ok", false).put("error", "JSON 解析失败")
+        if (obj.has("master")) MockStore.setEnabled(ctx, obj.optBoolean("master"))
+        obj.optJSONArray("enabled")?.let { arr ->
+            val pkgs = (0 until arr.length()).map { arr.optString(it) }.filter { it.isNotBlank() }.toSet()
+            val current = MockStore.enabledApps(ctx)
+            (current - pkgs).forEach { MockStore.setAppEnabled(ctx, it, false) }
+            pkgs.forEach { MockStore.setAppEnabled(ctx, it, true) }
+        }
+        return JSONObject().apply {
+            put("ok", true)
+            put("enabled", MockStore.isEnabled(ctx))
+            put("enabledApps", JSONArray().apply { MockStore.enabledApps(ctx).forEach { put(it) } })
+        }
+    }
+
+    // ================= 报文读取 =================
+
+    private class Head(val startLine: String, val headers: List<String>)
+
+    /** 逐字节读取请求头（不用 BufferedReader，避免把 body 预读进缓冲区） */
+    private fun readHead(input: java.io.InputStream): Head? {
+        val startLine = readLine(input) ?: return null
+        if (startLine.isEmpty()) return null
+        val headers = mutableListOf<String>()
+        while (true) {
+            val line = readLine(input) ?: break
+            if (line.isEmpty()) break
+            headers.add(line)
+            if (headers.size > 200) return null
+        }
+        return Head(startLine, headers)
+    }
+
+    private fun readLine(input: java.io.InputStream): String? {
+        val sb = StringBuilder()
+        while (true) {
+            val c = input.read()
+            if (c < 0) return if (sb.isEmpty()) null else sb.toString()
+            if (c == '\n'.code) break
+            if (c != '\r'.code) sb.append(c.toChar())
+            if (sb.length > 8192) return null
+        }
+        return sb.toString()
+    }
+
+    /** 按 Content-Length 读取请求体（上限 8MB） */
+    private fun readBody(input: java.io.InputStream, headers: List<String>): ByteArray {
+        val len = headers.firstNotNullOfOrNull { h ->
+            val i = h.indexOf(':')
+            if (i > 0 && h.substring(0, i).trim().equals("Content-Length", true))
+                h.substring(i + 1).trim().toLongOrNull() else null
+        } ?: 0L
+        if (len <= 0) return ByteArray(0)
+        val n = len.coerceAtMost(8L * 1024 * 1024).toInt()
+        val buf = ByteArray(n)
+        var off = 0
+        while (off < n) {
+            val r = input.read(buf, off, n - off)
+            if (r < 0) break
+            off += r
+        }
+        return if (off == n) buf else buf.copyOf(off)
     }
 
     // ================= WebSocket =================

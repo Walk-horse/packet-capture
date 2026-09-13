@@ -66,11 +66,20 @@ final class SyncClient: ObservableObject {
     /// WS 推送是否已连接（实时增量通道；原轮询通道照常保留作为兜底）
     @Published private(set) var wsConnected = false
 
+    /// 手机端接口模拟状态（随 /api/state 轮询更新）
+    @Published private(set) var mockStatus: MockStatus?
+
     /// 本地最多保留条数（超出丢弃最旧的，与手机端 500 上限解耦）
     private let maxLocal = 2000
     private var ids: Set<String> = []
     private var timer: Timer?
-    private var inFlight = false
+    /// 拉取调度：单 worker + 待办折叠（全量优先），避免请求被丢弃或堆积
+    private var workerRunning = false
+    private var incrementalRequested = false
+    private var fullRequested = false
+    /// 自愈限频：上次尝试重建 adb forward 的时间 / 是否正在进行
+    private var lastHealAt = Date.distantPast
+    private var healInFlight = false
 
     init() {
         let ud = UserDefaults.standard
@@ -227,23 +236,46 @@ final class SyncClient: ObservableObject {
 
     /// 启动自动同步（首次进入或地址变更后调用）
     func startIfNeeded() {
-        if exchanges.isEmpty { Task { await pull() } }
+        // 启动必拉一次：本地为空时必须走全量。
+        // 增量请求在手机端「synced 标志位」协议下多半回空（历史记录早已被消费过），
+        // 否则会出现「已连接、状态正常，但列表 0 条」。
+        Task { await pullSmart() }
         schedule()
         connectWs()
     }
 
+    /// 智能选择拉取方式：本地为空 → 全量（否则列表会一直是空的）；有数据 → 增量
+    func pullSmart() async {
+        await pull(full: exchanges.isEmpty)
+    }
+
     // MARK: - 同步
 
-    /// 增量同步一次；full = true 时忽略游标，整体替换本地数据
+    /// 增量同步一次；full = true 时请求全量（手机端回传全部并置已同步）
+    ///
+    /// 并发调用采用「合并待办 + 单 worker」：同一时刻只有一个请求在飞，期间到来的请求
+    /// 折叠成待办（全量优先），worker 跑完继续消费。
+    /// 早期用 `if inFlight { return }` 会**静默丢弃**请求——启动时的全量兜底与定时器
+    /// 触发的增量很容易撞上，全量被吞掉就表现为偶发空列表；直接排队又会在网络卡顿时堆积请求。
     func pull(full: Bool = false) async {
-        guard !inFlight else { return }
+        if full { fullRequested = true } else { incrementalRequested = true }
+        guard !workerRunning else { return }
+        workerRunning = true
+        defer { workerRunning = false }
+        while fullRequested || incrementalRequested {
+            let doFull = fullRequested
+            fullRequested = false
+            incrementalRequested = false
+            await performPull(full: doFull)
+        }
+    }
+
+    private func performPull(full: Bool) async {
         guard let url = makeURL(full: full) else {
             status = .failed("请先在工具栏填写手机同步地址")
             return
         }
-        inFlight = true
         status = .syncing
-        defer { inFlight = false }
         do {
             var request = URLRequest(
                 url: url,
@@ -259,8 +291,13 @@ final class SyncClient: ObservableObject {
             }.value
             apply(state)
             status = .ok(Date())
+            // HTTP 通道通了说明链路正常，清掉 WS 失败计数（避免误触发自愈）
+            wsFailStreak = 0
+            Self.logLine("pull \(full ? "全量" : "增量") 成功：本次 \(state.exchanges.count) 条，累计 \(exchanges.count) 条")
         } catch {
             status = .failed(friendly(error))
+            Self.logLine("pull \(full ? "全量" : "增量") 失败：\(friendly(error))")
+            selfHealForwardIfNeeded()
         }
     }
 
@@ -275,17 +312,27 @@ final class SyncClient: ObservableObject {
 
     private var wsTask: URLSessionWebSocketTask?
     private var wsRetry: Task<Void, Never>?
+    /// WS 连接代次：用于忽略「主动重连」产生的旧连接回调（否则形成重连风暴）
+    private var wsGeneration = 0
+    /// WS 连续失败次数（成功即清零）：连续失败才触发 adb forward 自愈
+    private var wsFailStreak = 0
 
     /// 连接手机端 WS 推送通道（ws://<addr>/api/ws）。
     /// 原 HTTP 轮询通道保持不变，WS 仅作为实时增量补充；断线自动重连。
+    ///
+    /// 用 `wsGeneration` 标记连接代次：主动重连时会 cancel 旧 task，旧 task 的 receive 回调
+    /// 会以 failure 返回——若不区分，就会「自己掐断自己 → 判定失败 → 再重连」形成重连风暴
+    /// （进一步还会误触发 adb forward 自愈，把正常链路反复重建）。
     func connectWs() {
+        wsGeneration += 1
+        let gen = wsGeneration
         wsTask?.cancel(with: .goingAway, reason: nil)
         wsTask = nil
         guard let url = wsURL() else { return }
         let task = URLSession.shared.webSocketTask(with: url)
         wsTask = task
         task.resume()
-        receiveWs(task)
+        receiveWs(task, gen: gen)
     }
 
     private func wsURL() -> URL? {
@@ -302,19 +349,32 @@ final class SyncClient: ObservableObject {
         return comps?.url?.appendingPathComponent("api/ws")
     }
 
-    private func receiveWs(_ task: URLSessionWebSocketTask) {
+    private func receiveWs(_ task: URLSessionWebSocketTask, gen: Int) {
         task.receive { [weak self] result in
             Task { @MainActor in
                 guard let self else { return }
+                // 旧代次连接的回调（多半是主动重连时被 cancel 的），直接忽略
+                guard gen == self.wsGeneration else { return }
                 switch result {
                 case .failure:
                     self.wsConnected = false
+                    self.wsFailStreak += 1
                     self.scheduleWsRetry()
+                    // 连续失败 → 做一次 HTTP 探活：
+                    //   探活成功 → 链路其实正常（WS 自身抖动），不折腾；
+                    //   探活失败 → 由 performPull 的错误分支统一触发 adb forward 自愈。
+                    // 这样「是否重建转发」只有一个判定入口，WS 抖动不会误触发重建
+                    // （重建会掐断正常连接，反而把链路搞坏）。
+                    if self.wsFailStreak >= 3 {
+                        self.wsFailStreak = 0
+                        Task { await self.pullSmart() }
+                    }
                 case .success(let msg):
+                    self.wsFailStreak = 0
                     if case .string(let text) = msg {
                         self.handleWsText(text)
                     }
-                    self.receiveWs(task)
+                    self.receiveWs(task, gen: gen)
                 }
             }
         }
@@ -382,6 +442,77 @@ final class SyncClient: ObservableObject {
         status = .idle
     }
 
+    // MARK: - adb forward 自愈
+
+    /// 连接失败时自动重建 adb forward。
+    ///
+    /// 背景：`adb forward` 规则不跨 USB 断连持久化——手机插拔/锁屏重连后规则就丢了，
+    /// 表现为「面板连不上手机」。当同步地址是本机回环（127.0.0.1/localhost）时，
+    /// 连不上几乎必然意味着转发规则丢失，这里限频重建，下一轮轮询即自动恢复。
+    private func selfHealForwardIfNeeded() {
+        guard Self.isLoopbackAddress(address) else { return }
+        guard !healInFlight else { return }
+        guard Date().timeIntervalSince(lastHealAt) >= 8 else { return }
+        guard let adb = Self.adbPath(), let port = Self.port(from: address) else { return }
+
+        lastHealAt = Date()
+        healInFlight = true
+        let serial = selectedSerial
+        Task.detached(priority: .utility) { [weak self] in
+            _ = try? Self.runAdb(["forward", "--remove", "tcp:\(port)"], adb: adb)
+            var args: [String] = []
+            if let serial { args += ["-s", serial] }
+            args += ["forward", "tcp:\(port)", "tcp:17890"]
+            let ok = (try? Self.runAdb(args, adb: adb)) != nil
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.healInFlight = false
+                Self.logLine(ok
+                    ? "[ok] 连接失败，已重建 adb forward tcp:\(port) -> tcp:17890\(serial.map { " (serial \($0))" } ?? "")"
+                    : "[x] 重建 adb forward tcp:\(port) 失败（手机是否已插好/授权？）")
+                guard ok else { return }
+                // 通道恢复后立刻补一次：自动同步关闭时（autoSync=0）没有定时器，
+                // 不补拉的话面板会一直停在「失败」状态不恢复。
+                self.connectWs()
+                Task { await self.pullSmart() }
+            }
+        }
+    }
+
+    /// 地址是否指向本机回环（只有这种地址才靠 adb forward，才值得自愈）
+    private nonisolated static func isLoopbackAddress(_ addr: String) -> Bool {
+        var s = addr.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        s = s.replacingOccurrences(of: "http://", with: "")
+        s = s.replacingOccurrences(of: "https://", with: "")
+        s = s.replacingOccurrences(of: "/api/state", with: "")
+        let host = s.split(separator: ":").first.map(String.init) ?? s
+        return host == "127.0.0.1" || host == "localhost" || host == "::1"
+    }
+
+    /// 从地址里取本地端口（默认 17890）
+    private nonisolated static func port(from addr: String) -> Int? {
+        var s = addr.trimmingCharacters(in: .whitespacesAndNewlines)
+        s = s.replacingOccurrences(of: "http://", with: "")
+        s = s.replacingOccurrences(of: "https://", with: "")
+        s = s.replacingOccurrences(of: "/api/state", with: "")
+        let parts = s.split(separator: ":")
+        guard parts.count >= 2, let p = Int(parts[1].prefix(while: { $0.isNumber })) else { return 17890 }
+        return p
+    }
+
+    /// 诊断日志：/tmp/streamdesk-panel.log（排查「连不上 / 列表为空」时先看这里）
+    private nonisolated static func logLine(_ msg: String) {
+        let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(msg)\n"
+        let path = "/tmp/streamdesk-panel.log"
+        if let h = FileHandle(forWritingAtPath: path) {
+            h.seekToEndOfFile()
+            h.write(Data(line.utf8))
+            try? h.close()
+        } else {
+            try? line.write(toFile: path, atomically: true, encoding: .utf8)
+        }
+    }
+
     // MARK: - 内部
 
     private func apply(_ s: SyncState) {
@@ -395,6 +526,7 @@ final class SyncClient: ObservableObject {
         )
         sessions = s.sessions
         passthrough = s.passthrough
+        if let m = s.mock { mockStatus = m }
 
         if s.full {
             exchanges = s.exchanges
@@ -414,18 +546,83 @@ final class SyncClient: ObservableObject {
     }
 
     private func makeURL(full: Bool) -> URL? {
+        guard var url = endpoint("/api/state") else { return nil }
+        if full {
+            url = URL(string: url.absoluteString + "?full=1") ?? url
+        }
+        return url
+    }
+
+    /// 按手机地址拼出某个 API 的完整 URL（自动补 http://、去掉多余的 /api/xxx）
+    private func endpoint(_ path: String) -> URL? {
         var base = address.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !base.isEmpty else { return nil }
         if !base.hasPrefix("http://") && !base.hasPrefix("https://") {
             base = "http://" + base
         }
         base = base.replacingOccurrences(of: "/api/state", with: "")
+        base = base.replacingOccurrences(of: "/api/mock", with: "")
         while base.hasSuffix("/") { base.removeLast() }
+        return URL(string: base + path)
+    }
 
-        var fullPath = base + "/api/state"
-        // full=1 时手机端返回全部请求（不管是否已同步）；否则只返回尚未同步的部分
-        if full { fullPath += "?full=1" }
-        return URL(string: fullPath)
+    // MARK: - 接口模拟
+
+    /// 把本地规则推送到手机（整体覆盖）。
+    /// 手机端只有「开启总开关 + 对应应用开关」的应用才会走模拟响应。
+    func pushMock(_ rules: [MockRule]) async -> String {
+        guard let url = endpoint("/api/mock") else { return "请先填写手机同步地址" }
+        var req = URLRequest(url: url, timeoutInterval: 12)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        do {
+            req.httpBody = try JSONEncoder().encode(["rules": rules])
+        } catch {
+            return "规则序列化失败：\(error.localizedDescription)"
+        }
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse else { return "推送失败：无响应" }
+            let result = try? JSONDecoder().decode(MockPushResult.self, from: data)
+            if http.statusCode == 200, result?.ok == true {
+                Self.logLine("mock 推送成功：\(result?.count ?? rules.count) 条规则")
+                await refreshMockStatus()
+                return "已推送 \(result?.count ?? rules.count) 条规则到手机"
+            }
+            let msg = result?.error ?? "HTTP \(http.statusCode)"
+            Self.logLine("mock 推送失败：\(msg)")
+            return "推送失败：\(msg)"
+        } catch {
+            Self.logLine("mock 推送失败：\(friendly(error))")
+            return "推送失败：\(friendly(error))"
+        }
+    }
+
+    /// 拉取手机端当前的接口模拟配置（含规则明细，可用于反向同步）
+    func fetchMockConfig() async -> MockConfigResponse? {
+        guard let url = endpoint("/api/mock") else { return nil }
+        var req = URLRequest(url: url, timeoutInterval: 12)
+        req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        do {
+            let (data, _) = try await URLSession.shared.data(for: req)
+            let cfg = try JSONDecoder().decode(MockConfigResponse.self, from: data)
+            mockStatus = MockStatus(
+                enabled: cfg.enabled ?? false,
+                ruleCount: cfg.rules?.count ?? 0,
+                enabledApps: cfg.enabledApps ?? [],
+                updatedAt: cfg.updatedAt
+            )
+            return cfg
+        } catch {
+            Self.logLine("mock 拉取配置失败：\(friendly(error))")
+            return nil
+        }
+    }
+
+    /// 只刷新手机端接口模拟状态（不改规则）
+    func refreshMockStatus() async {
+        _ = await fetchMockConfig()
     }
 
     private func schedule() {

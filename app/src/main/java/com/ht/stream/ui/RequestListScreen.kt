@@ -629,12 +629,23 @@ fun ExchangeRow(e: HttpExchange, onClick: () -> Unit) {
                     }
                 )
             )
-            Text(
-                e.host,
-                fontSize = 11.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1, overflow = TextOverflow.Ellipsis
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (e.mocked) {
+                    Text(
+                        "模拟",
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF7B1FA2)
+                    )
+                    Spacer(Modifier.width(4.dp))
+                }
+                Text(
+                    e.host,
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis
+                )
+            }
         }
         Spacer(Modifier.width(8.dp))
         Column(horizontalAlignment = Alignment.End) {
