@@ -75,6 +75,28 @@ object RequestStore {
         _tick.value = System.nanoTime()
     }
 
+    /**
+     * 同步专用：返回待同步的请求记录并在返回时将其标记为已同步。
+     * - full=true：返回全部「已落定」记录并把它们置为已同步（桌面端全量重新同步）
+     * - full=false：仅返回「已落定且尚未同步」的记录并置已同步（自动增量同步）
+     * 「已落定」= 状态不是 PENDING（即 COMPLETE / FAILED）。处于 PENDING 的请求响应体尚未到达，
+     * 若此刻就标已同步，等响应回来也不会再下发，导致桌面端永远看到空响应体；因此 PENDING 排除在外，
+     * 待其落定后下一轮同步（HTTP 轮询 / WS tick）自然会带上完整响应体。
+     * 整个「读取 + 置位」在 synchronized 内完成，避免 HTTP 轮询与 WS 推送重复下发同一条。
+     */
+    @Synchronized
+    fun takeExchangesForSync(full: Boolean): List<HttpExchange> {
+        val settled = _exchanges.value.filter { it.state != HttpExchange.State.PENDING }
+        return if (full) {
+            settled.forEach { it.synced = true }
+            settled
+        } else {
+            val pending = settled.filter { !it.synced }
+            pending.forEach { it.synced = true }
+            pending
+        }
+    }
+
     /** 透传连接：连接建立时记录（endTime=0 表示进行中） */
     @Synchronized
     fun addPassthrough(p: PassthroughRec) {
