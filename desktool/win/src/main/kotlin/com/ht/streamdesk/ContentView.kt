@@ -69,9 +69,6 @@ fun ContentView(client: SyncClient) {
         // 首次启动（无保存地址）自动做一次 USB 探测，插上手机打开即用
         if (client.address.value.isBlank()) client.detectUsb()
         client.startIfNeeded()
-        // 本地无数据（首次启动/刚清空）时自动全量拉一次：手机端 synced 是全局标志，
-        // 若另一台面板先跑过，增量会一直是空；空面板直接全量兜底
-        if (client.exchanges.value.isEmpty()) client.resetAndPull()
         logd("startup done: autoSync=${client.autoSync.value}")
     }
 
