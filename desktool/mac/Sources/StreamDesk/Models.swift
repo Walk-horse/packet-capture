@@ -13,6 +13,8 @@ struct SyncState: Decodable {
     let sessions: [SessionInfo]
     let passthrough: [PassRecord]
     let exchanges: [ExchangeRecord]
+    /// 手机端接口模拟状态（手机未上报时为 nil）
+    let mock: MockStatus?
 }
 
 /// 手机端 WS 推送消息（快照 / 增量），与 SyncJson.wsSnapshot / wsDelta 字段对应
@@ -70,6 +72,10 @@ struct ExchangeRecord: Decodable, Identifiable {
     let state: String
     let error: String?
     let favorite: Bool
+    /// 该响应由手机端「接口模拟」返回
+    let mocked: Bool?
+    /// 模拟响应体为「按响应数据类型自动生成」的示例
+    let mockAuto: Bool?
     let remoteIp: String?
     let uid: Int
     let startTime: Int64
@@ -104,6 +110,8 @@ struct ExchangeRecord: Decodable, Identifiable {
 
     var isFailed: Bool { state == "FAILED" }
     var isPending: Bool { state == "PENDING" }
+    var isMocked: Bool { mocked == true }
+    var isMockAuto: Bool { mockAuto == true }
     var displayPath: String { path.isEmpty ? "/" : path }
 }
 
@@ -139,4 +147,5 @@ enum Panel: Hashable {
     case session(String)
     case domain(String)
     case passthrough
+    case mock
 }

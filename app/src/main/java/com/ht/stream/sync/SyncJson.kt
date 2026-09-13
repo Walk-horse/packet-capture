@@ -120,6 +120,8 @@ object SyncJson {
         o.put("state", e.state.name)
         e.error?.let { o.put("error", it) }
         o.put("favorite", e.favorite)
+        o.put("mocked", e.mocked)
+        o.put("mockAuto", e.mockAuto)
         e.remoteIp?.let { o.put("remoteIp", it) }
         o.put("uid", e.uid)
         o.put("startTime", e.startTime)

@@ -66,6 +66,9 @@ final class SyncClient: ObservableObject {
     /// WS 推送是否已连接（实时增量通道；原轮询通道照常保留作为兜底）
     @Published private(set) var wsConnected = false
 
+    /// 手机端接口模拟状态（随 /api/state 轮询更新）
+    @Published private(set) var mockStatus: MockStatus?
+
     /// 本地最多保留条数（超出丢弃最旧的，与手机端 500 上限解耦）
     private let maxLocal = 2000
     private var ids: Set<String> = []
@@ -523,6 +526,7 @@ final class SyncClient: ObservableObject {
         )
         sessions = s.sessions
         passthrough = s.passthrough
+        if let m = s.mock { mockStatus = m }
 
         if s.full {
             exchanges = s.exchanges
@@ -542,18 +546,83 @@ final class SyncClient: ObservableObject {
     }
 
     private func makeURL(full: Bool) -> URL? {
+        guard var url = endpoint("/api/state") else { return nil }
+        if full {
+            url = URL(string: url.absoluteString + "?full=1") ?? url
+        }
+        return url
+    }
+
+    /// 按手机地址拼出某个 API 的完整 URL（自动补 http://、去掉多余的 /api/xxx）
+    private func endpoint(_ path: String) -> URL? {
         var base = address.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !base.isEmpty else { return nil }
         if !base.hasPrefix("http://") && !base.hasPrefix("https://") {
             base = "http://" + base
         }
         base = base.replacingOccurrences(of: "/api/state", with: "")
+        base = base.replacingOccurrences(of: "/api/mock", with: "")
         while base.hasSuffix("/") { base.removeLast() }
+        return URL(string: base + path)
+    }
 
-        var fullPath = base + "/api/state"
-        // full=1 时手机端返回全部请求（不管是否已同步）；否则只返回尚未同步的部分
-        if full { fullPath += "?full=1" }
-        return URL(string: fullPath)
+    // MARK: - 接口模拟
+
+    /// 把本地规则推送到手机（整体覆盖）。
+    /// 手机端只有「开启总开关 + 对应应用开关」的应用才会走模拟响应。
+    func pushMock(_ rules: [MockRule]) async -> String {
+        guard let url = endpoint("/api/mock") else { return "请先填写手机同步地址" }
+        var req = URLRequest(url: url, timeoutInterval: 12)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        do {
+            req.httpBody = try JSONEncoder().encode(["rules": rules])
+        } catch {
+            return "规则序列化失败：\(error.localizedDescription)"
+        }
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse else { return "推送失败：无响应" }
+            let result = try? JSONDecoder().decode(MockPushResult.self, from: data)
+            if http.statusCode == 200, result?.ok == true {
+                Self.logLine("mock 推送成功：\(result?.count ?? rules.count) 条规则")
+                await refreshMockStatus()
+                return "已推送 \(result?.count ?? rules.count) 条规则到手机"
+            }
+            let msg = result?.error ?? "HTTP \(http.statusCode)"
+            Self.logLine("mock 推送失败：\(msg)")
+            return "推送失败：\(msg)"
+        } catch {
+            Self.logLine("mock 推送失败：\(friendly(error))")
+            return "推送失败：\(friendly(error))"
+        }
+    }
+
+    /// 拉取手机端当前的接口模拟配置（含规则明细，可用于反向同步）
+    func fetchMockConfig() async -> MockConfigResponse? {
+        guard let url = endpoint("/api/mock") else { return nil }
+        var req = URLRequest(url: url, timeoutInterval: 12)
+        req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        do {
+            let (data, _) = try await URLSession.shared.data(for: req)
+            let cfg = try JSONDecoder().decode(MockConfigResponse.self, from: data)
+            mockStatus = MockStatus(
+                enabled: cfg.enabled ?? false,
+                ruleCount: cfg.rules?.count ?? 0,
+                enabledApps: cfg.enabledApps ?? [],
+                updatedAt: cfg.updatedAt
+            )
+            return cfg
+        } catch {
+            Self.logLine("mock 拉取配置失败：\(friendly(error))")
+            return nil
+        }
+    }
+
+    /// 只刷新手机端接口模拟状态（不改规则）
+    func refreshMockStatus() async {
+        _ = await fetchMockConfig()
     }
 
     private func schedule() {

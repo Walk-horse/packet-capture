@@ -32,6 +32,12 @@ class HttpExchange(
     /** 是否收藏 */
     var favorite: Boolean = false
 
+    /** 该响应由「接口模拟」返回（未走真实服务器） */
+    var mocked: Boolean = false
+
+    /** 模拟响应体是「按响应数据类型自动生成」的示例（规则未配置示例） */
+    var mockAuto: Boolean = false
+
     /**
      * 是否已同步到桌面端。默认 false（新建记录待同步）。
      * 手机端在增量/全量同步下发该记录后置 true，之后自动同步只下发未同步部分。

@@ -3,6 +3,7 @@ import AppKit
 
 struct SidebarView: View {
     @EnvironmentObject var client: SyncClient
+    @EnvironmentObject var store: MockRuleStore
     @Binding var panel: Panel
     @State private var showAllDomains = false
 
@@ -83,6 +84,25 @@ struct SidebarView: View {
                 }
             }
 
+            Section("接口模拟") {
+                HStack {
+                    Label("接口配置", systemImage: "arrow.triangle.2.circlepath")
+                    Spacer()
+                    countBadge(store.rules.count)
+                }
+                .tag(Panel.mock)
+
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill((client.mockStatus?.enabled ?? false) ? Color.green : Color.secondary.opacity(0.5))
+                        .frame(width: 6, height: 6)
+                    Text(mockSummary)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+
             Section("其他") {
                 HStack {
                     Label("透传连接", systemImage: "lock.slash")
@@ -102,6 +122,11 @@ struct SidebarView: View {
             .font(.system(size: 11))
             .foregroundStyle(.secondary)
             .monospacedDigit()
+    }
+
+    private var mockSummary: String {
+        guard let m = client.mockStatus else { return "状态未知" }
+        return m.enabled ? "手机端已开启 · \(m.enabledApps.count) 应用" : "手机端未开启"
     }
 }
 

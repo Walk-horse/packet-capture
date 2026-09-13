@@ -25,6 +25,7 @@ import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.List
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.OpenInNew
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material3.Button
@@ -115,7 +116,8 @@ fun OverviewScreen(
                 GridItem("构建请求", Icons.Default.Create, StreamColors.Blue) { nav(Screen.BuildRequest()) },
                 GridItem("Hosts 设置", Icons.Default.Info, StreamColors.Blue) { nav(Screen.Hosts) },
                 GridItem("收藏请求", Icons.Default.Star, StreamColors.Blue) { nav(Screen.Favorites) },
-                GridItem("常用工具", Icons.Default.Build, StreamColors.Blue) { nav(Screen.Tools) }
+                GridItem("常用工具", Icons.Default.Build, StreamColors.Blue) { nav(Screen.Tools) },
+                GridItem("接口模拟", Icons.Default.PlayArrow, StreamColors.Teal) { nav(Screen.Mock) }
             )
         )
 

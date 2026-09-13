@@ -34,6 +34,7 @@ import com.ht.stream.ui.HttpsScreen
 import com.ht.stream.ui.LaunchApp
 import com.ht.stream.ui.LogsScreen
 import com.ht.stream.ui.ModeScreen
+import com.ht.stream.ui.MockScreen
 import com.ht.stream.ui.OverviewScreen
 import com.ht.stream.ui.RequestListScreen
 import com.ht.stream.ui.StreamTheme
@@ -53,6 +54,7 @@ sealed interface Screen {
     data class BuildRequest(val replayId: String? = null) : Screen
     data object Hosts : Screen
     data object Tools : Screen
+    data object Mock : Screen
     data object Https : Screen
     data object CaptureMode : Screen
     data object Logs : Screen
@@ -100,6 +102,8 @@ class MainActivity : ComponentActivity() {
             SyncPrefs.setOn(this, true)
             SyncServer.start()
         }
+        // 注入上下文：同步服务需要读写「接口模拟」配置
+        SyncServer.attach(this)
         setContent { StreamTheme { Root() } }
     }
 }
@@ -112,6 +116,8 @@ fun Root() {
         mutableStateListOf<Screen>(Screen.Overview).apply {
             // 调试通道：am start --ez picker true 直接进入「选择进程」页（本机 adb input 被限制时用于验证）
             if ((context as? Activity)?.intent?.getBooleanExtra("picker", false) == true) add(Screen.WindowPick)
+            // 调试通道：am start --ez mock true 直接进入「接口模拟」设置页（同上）
+            if ((context as? Activity)?.intent?.getBooleanExtra("mock", false) == true) add(Screen.Mock)
         }
     }
     val nav: (Screen) -> Unit = { stack.add(it) }
@@ -237,6 +243,7 @@ fun Root() {
         )
         Screen.Hosts -> HostsScreen(onBack = back)
         Screen.Tools -> ToolsScreen(onBack = back)
+        Screen.Mock -> MockScreen(onBack = back)
         Screen.Https -> HttpsScreen(onBack = back)
         Screen.CaptureMode -> ModeScreen(onBack = back)
         Screen.Logs -> LogsScreen(onBack = back, onOpen = { nav(Screen.LogView(it)) })

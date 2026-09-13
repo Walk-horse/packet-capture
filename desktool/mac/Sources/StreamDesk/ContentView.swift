@@ -2,8 +2,11 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject var client: SyncClient
+    @StateObject private var mockStore = MockRuleStore()
+    @StateObject private var yapiSettings = YapiSettings()
     @State private var panel: Panel = .all
     @State private var selectedId: String?
+    @State private var selectedRuleId: String?
     @State private var search = ""
     @State private var showConfig = false
 
@@ -11,10 +14,20 @@ struct ContentView: View {
         NavigationSplitView {
             SidebarView(panel: $panel)
         } content: {
-            RequestListView(panel: panel, selectedId: $selectedId, search: $search)
+            if panel == .mock {
+                MockListView(selectedId: $selectedRuleId)
+            } else {
+                RequestListView(panel: panel, selectedId: $selectedId, search: $search)
+            }
         } detail: {
-            DetailView(id: selectedId)
+            if panel == .mock {
+                MockEditorView(ruleId: selectedRuleId)
+            } else {
+                DetailView(id: selectedId)
+            }
         }
+        .environmentObject(mockStore)
+        .environmentObject(yapiSettings)
         .toolbar { toolbarContent }
         .onAppear { client.startIfNeeded() }
         .sheet(isPresented: $showConfig) {
