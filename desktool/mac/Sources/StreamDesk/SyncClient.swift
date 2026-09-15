@@ -65,6 +65,8 @@ final class SyncClient: ObservableObject {
     @Published var needsPick = false
     /// WS 推送是否已连接（实时增量通道；原轮询通道照常保留作为兜底）
     @Published private(set) var wsConnected = false
+    /// 一键重联进行中（UI 用于禁用按钮 / 展示进度）
+    @Published private(set) var reconnecting = false
 
     /// 手机端接口模拟状态（随 /api/state 轮询更新）
     @Published private(set) var mockStatus: MockStatus?
@@ -477,6 +479,93 @@ final class SyncClient: ObservableObject {
                 Task { await self.pullSmart() }
             }
         }
+    }
+
+    // MARK: - 一键重联移动端
+
+    /// 主动诊断 + 修复整条链路，区别于被动限频自愈 `selfHealForwardIfNeeded`。
+    ///
+    /// 旧轮询自愈只在「HTTP 拉取失败且地址为回环」时限频 8s 重建一次 `adb forward`：
+    /// - 不重启 adb server —— USB 授权丢失 / 守护进程僵死时 forward 建了也无效；
+    /// - 被动触发 —— autoSync=0 时定时器不跑，永远走不到自愈；
+    /// - 不重连 WS、不主动补拉 —— 链路恢复不即时。
+    ///
+    /// 本方法把恢复链跑一遍并逐条写诊断日志（`/tmp/streamdesk-panel.log`）：
+    /// 1. 重启 adb server（修复 USB 授权 / 守护进程异常，这是旧自愈漏掉的关键一步）
+    /// 2. 探测已授权 USB 设备（USB 物理层 / 授权问题在此暴露）
+    /// 3. 按设备重建 adb forward（移除旧规则 + 重新建立）
+    /// 4. 重连 WS 推送通道并全量补拉数据
+    func reconnect() async {
+        guard !reconnecting else { return }
+        reconnecting = true
+        status = .syncing
+        Self.logLine("=== 一键重联移动端 ===")
+        defer {
+            reconnecting = false
+            Self.logLine("=== 重联结束 ===")
+        }
+
+        // 非回环（Wi-Fi / 直连 IP）：adb 修不了网络层，只重连通道 + 补拉
+        guard Self.isLoopbackAddress(address) else {
+            Self.logLine("[i] 地址非回环（Wi-Fi/直连），跳过 adb 修复，仅重连通道并补拉")
+            connectWs()
+            await resetAndPull()
+            return
+        }
+
+        guard let adb = Self.adbPath() else {
+            status = .failed("未找到 adb，无法执行重联（请安装 Android SDK 平台工具并加入 PATH）")
+            Self.logLine("[x] 未找到 adb，重联终止")
+            return
+        }
+
+        // 1) 重启 adb server：修复 USB 授权丢失 / 守护进程僵死导致 forward 规则无效
+        Self.logLine("[1/4] 重启 adb server…")
+        _ = try? Self.runAdb(["kill-server"], adb: adb)
+        do {
+            _ = try Self.runAdb(["start-server"], adb: adb)
+            Self.logLine("    adb server 已重启")
+        } catch {
+            Self.logLine("    adb start-server 失败：\(friendly(error))")
+        }
+
+        // 2) 探测设备：确认 USB 物理层正常 + 已授权（这里能暴露插拔/锁屏导致的掉线）
+        Self.logLine("[2/4] 探测 USB 设备…")
+        var serial = selectedSerial
+        let list = (try? Self.runAdb(["devices", "-l"], adb: adb)).map { Self.parseDeviceList($0) } ?? []
+        if let s = serial, list.contains(where: { $0.serial == s }) {
+            Self.logLine("    沿用已选设备 \(s)")
+        } else if let first = list.first {
+            serial = first.serial
+            selectedSerial = serial
+            Self.logLine("    自动选用设备 \(serial ?? "")")
+        } else {
+            status = .failed("未发现已授权的 USB 设备（请检查 USB 连接与调试授权）")
+            Self.logLine("    无可用 USB 设备，重联终止")
+            return
+        }
+
+        // 3) 重建 adb forward：移除旧规则（USB 断连后规则往往已失效/残留）后按设备重建
+        Self.logLine("[3/4] 重建 adb forward…")
+        let port = Self.port(from: address) ?? 17890
+        _ = try? Self.runAdb(["forward", "--remove", "tcp:\(port)"], adb: adb)
+        let ok = (try? Self.runAdb(["-s", serial!, "forward", "tcp:\(port)", "tcp:17890"], adb: adb)) != nil
+        if ok {
+            Self.logLine("    forward tcp:\(port) → \(serial!):tcp:17890 已建立")
+        } else {
+            Self.logLine("    带 -s 建立失败，尝试不带 -s 兜底")
+            let ok2 = (try? Self.runAdb(["forward", "tcp:\(port)", "tcp:17890"], adb: adb)) != nil
+            if !ok2 {
+                status = .failed("adb forward 建立失败（手机端 App 是否已启动抓包？）")
+                Self.logLine("    forward 仍失败，重联终止")
+                return
+            }
+        }
+
+        // 4) 重连 WS + 全量补拉：本地空则全量已在 resetAndPull 内处理，这里统一全量拉一次以恢复列表
+        Self.logLine("[4/4] 重连推送通道并全量补拉…")
+        connectWs()
+        await resetAndPull()
     }
 
     /// 地址是否指向本机回环（只有这种地址才靠 adb forward，才值得自愈）

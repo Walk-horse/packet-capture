@@ -26,6 +26,18 @@ struct SyncConfigView: View {
                 .keyboardShortcut(.escape, modifiers: [])
             }
 
+            Button {
+                Task { await client.reconnect() }
+            } label: {
+                Label(client.reconnecting ? "重联中…" : "一键重联移动端",
+                      systemImage: "arrow.triangle.2.circlepath")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.regular)
+            .disabled(client.reconnecting)
+            .help("重启 adb server → 探测设备 → 重建转发 → 重连推送并全量补拉")
+
             // 手机地址
             VStack(alignment: .leading, spacing: 6) {
                 Text("手机同步地址")

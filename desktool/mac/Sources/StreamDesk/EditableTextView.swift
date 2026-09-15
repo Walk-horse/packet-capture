@@ -1,26 +1,42 @@
 import SwiftUI
 import AppKit
 
-/// 大文本渲染视图：用 NSTextView 承载，避免 SwiftUI Text 在 MB 级文本上的布局卡顿。
-/// 关键优化：开启 allowsNonContiguousLayout，仅布局可见区域，MB 级文本切换/滚动不再卡主线程。
-/// 附带搜索：query 非空时高亮全部匹配（黄色），并按 matchIndex 滚动到当前匹配。
-struct LargeTextView: NSViewRepresentable {
-    let text: String
+/// 可编辑大文本视图：用 NSTextView 承载，支持就地编辑，并复用「只读」LargeTextView 的搜索高亮 / 跳转能力。
+/// - text：与外部状态双向绑定（body 文本）
+/// - query / matchIndex / matchCount：搜索词、当前匹配序号、命中总数
+struct EditableTextView: NSViewRepresentable {
+    @Binding var text: String
     var fontSize: CGFloat = 12
     var query: String = ""
     var exactMatch: Bool = false
-    var matchIndex: Int = 0
-    var matchCount: Binding<Int>
+    var matchIndex: Binding<Int> = .constant(0)
+    var matchCount: Binding<Int> = .constant(0)
+    /// 编辑结束（失焦）回调，用于「JSON 美化」自动美化等
+    var onEditingEnded: () -> Void = {}
 
-    final class Coordinator: NSObject {
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: EditableTextView
         var prevText = ""
         var prevQuery = ""
         var prevIndex = -1
         var prevCount = -1
         var ranges: [NSRange] = []
+        var onEditingEnded: () -> Void = {}
+
+        init(_ parent: EditableTextView) { self.parent = parent }
+
+        func textDidChange(_ notification: Notification) {
+            guard let tv = notification.object as? NSTextView else { return }
+            let s = tv.string
+            if s != parent.text { parent.text = s }
+        }
+
+        func textDidEndEditing(_ notification: Notification) {
+            onEditingEnded()
+        }
     }
 
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
 
     func makeNSView(context: Context) -> NSScrollView {
         let scroll = NSScrollView()
@@ -31,57 +47,64 @@ struct LargeTextView: NSViewRepresentable {
         scroll.borderType = .noBorder
 
         let tv = NSTextView()
-        tv.isEditable = false
+        tv.isEditable = true
         tv.isSelectable = true
         tv.isRichText = false
-        tv.allowsUndo = false
-        tv.usesFindBar = true
+        tv.allowsUndo = true
+        tv.usesFindBar = false
         tv.isAutomaticSpellingCorrectionEnabled = false
+        tv.isGrammarCheckingEnabled = false
         tv.backgroundColor = .clear
         tv.textColor = .labelColor
         tv.font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
         tv.isVerticallyResizable = true
-        tv.isHorizontallyResizable = true
+        tv.isHorizontallyResizable = false
         tv.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        // 核心优化：非连续布局，避免一次性全量排版 MB 级文本
+        tv.autoresizingMask = [.width, .height]
         tv.layoutManager?.allowsNonContiguousLayout = true
         if let container = tv.textContainer {
             container.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-            container.widthTracksTextView = false
+            container.widthTracksTextView = true
         }
+        tv.delegate = context.coordinator
+        tv.textStorage?.replaceCharacters(in: NSRange(location: 0, length: 0), with: text)
+        tv.scrollToBeginningOfDocument(nil)
 
         scroll.documentView = tv
         return scroll
     }
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
+        let co = context.coordinator
+        co.parent = self   // 保持 binding 最新（struct 每帧重建，coordinator 持久）
+        co.onEditingEnded = onEditingEnded   // 每帧刷新回调，确保闭包捕获最新状态
         guard let tv = scroll.documentView as? NSTextView,
               let lm = tv.layoutManager,
               let ts = tv.textStorage else { return }
-        let co = context.coordinator
 
-        // 文本变化：整体替换并回到顶部（强制后续重算高亮）
+        // 外部改动（YAPI 填充 / 生成 / 树编辑回写）：整体替换并回到顶部
         if tv.string != text {
             ts.replaceCharacters(in: NSRange(location: 0, length: ts.length), with: text)
             tv.scrollToBeginningOfDocument(nil)
+            tv.setSelectedRange(NSRange(location: 0, length: 0))
             co.prevText = text
             co.prevQuery = ""
             co.prevCount = -1
             co.ranges = []
         }
 
-        // 搜索词变化：重算高亮与匹配区间
+        // 搜索词变化：重算高亮与命中区间
         if query != co.prevQuery {
             applyHighlight(tv: tv, lm: lm, ts: ts, co: co)
             co.prevQuery = query
         }
 
-        // 当前匹配序号变化：滚动到对应区间（无需重算）
-        if matchIndex != co.prevIndex, !co.ranges.isEmpty {
-            let idx = min(max(matchIndex, 0), co.ranges.count - 1)
+        // 当前匹配序号变化：滚动并选中对应区间
+        if matchIndex.wrappedValue != co.prevIndex, !co.ranges.isEmpty {
+            let idx = min(max(matchIndex.wrappedValue, 0), co.ranges.count - 1)
             tv.scrollRangeToVisible(co.ranges[idx])
             tv.setSelectedRange(co.ranges[idx])
-            co.prevIndex = matchIndex
+            co.prevIndex = matchIndex.wrappedValue
         }
     }
 
@@ -94,7 +117,6 @@ struct LargeTextView: NSViewRepresentable {
             matchCount.wrappedValue = 0
             return
         }
-        // 直接在原串上做大小写不敏感搜索：lowercased 后下标会与原串错位（Unicode），导致高亮区间不准
         let s = ts.string
         let q = query
         let options: String.CompareOptions = exactMatch ? [.literal] : [.caseInsensitive, .diacriticInsensitive]
@@ -102,11 +124,10 @@ struct LargeTextView: NSViewRepresentable {
         var searchStart = s.startIndex
         while let r = s.range(of: q, options: options, range: searchStart..<s.endIndex) {
             searchStart = r.upperBound
-            if exactMatch, !isWordBoundaryMatch(s, r) { continue }
+            if exactMatch, !isEditableWordBoundaryMatch(s, r) { continue }
             ranges.append(NSRange(r, in: s))
-            if ranges.count >= 5000 { break } // 上限保护，避免极端情况卡顿
+            if ranges.count >= 5000 { break }
         }
-        // 淡黄色高亮
         let hl = NSColor(srgbRed: 1.0, green: 0.98, blue: 0.65, alpha: 1.0)
         for r in ranges {
             lm.addTemporaryAttribute(.backgroundColor, value: hl, forCharacterRange: r)
@@ -117,12 +138,11 @@ struct LargeTextView: NSViewRepresentable {
             matchCount.wrappedValue = count
             co.prevCount = count
         }
-        co.prevIndex = -1 // 触发下次滚动到首个匹配
+        co.prevIndex = -1
     }
 }
 
-/// 判断命中区间在精确模式下是否为独立词（前后非字母/数字/_）
-private func isWordBoundaryMatch(_ s: String, _ r: Range<String.Index>) -> Bool {
+private func isEditableWordBoundaryMatch(_ s: String, _ r: Range<String.Index>) -> Bool {
     let wordChars = CharacterSet.alphanumerics.union(.init(charactersIn: "_"))
     if r.lowerBound != s.startIndex {
         let prev = s.index(before: r.lowerBound)
