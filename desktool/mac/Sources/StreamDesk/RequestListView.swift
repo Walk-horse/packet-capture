@@ -63,7 +63,7 @@ struct RequestListView: View {
                         .foregroundStyle(.secondary)
                 }
                 .padding(.horizontal, 10)
-                .padding(.vertical, 6)
+                .padding(.vertical, 4)
                 .background(Color.primary.opacity(0.04))
             }
 
@@ -79,7 +79,7 @@ struct RequestListView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            .padding(8)
+            .padding(6)
 
             TypeFilterRow(counts: data.counts, selected: $typeSel)
 
@@ -240,7 +240,7 @@ private struct TypeFilterRow: View {
             }
             .padding(.horizontal, 8)
         }
-        .padding(.vertical, 6)
+        .padding(.vertical, 4)
     }
 }
 

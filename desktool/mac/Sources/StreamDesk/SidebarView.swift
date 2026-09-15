@@ -20,6 +20,26 @@ struct SidebarView: View {
         let all = domains
         let visible = showAllDomains ? all : Array(all.prefix(domainLimit))
         List(selection: $panel) {
+            // 接口模拟
+            Section("接口模拟") {
+                HStack {
+                    Label("接口配置", systemImage: "arrow.triangle.2.circlepath")
+                    Spacer()
+                    countBadge(store.rules.count)
+                }
+                .tag(Panel.mock)
+
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill((client.mockStatus?.enabled ?? false) ? Color.green : Color.secondary.opacity(0.5))
+                        .frame(width: 6, height: 6)
+                    Text(mockSummary)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+
             // 当前抓包信息
             Section("当前抓包") {
                 CurrentCaptureCard()
@@ -84,25 +104,6 @@ struct SidebarView: View {
                 }
             }
 
-            Section("接口模拟") {
-                HStack {
-                    Label("接口配置", systemImage: "arrow.triangle.2.circlepath")
-                    Spacer()
-                    countBadge(store.rules.count)
-                }
-                .tag(Panel.mock)
-
-                HStack(spacing: 5) {
-                    Circle()
-                        .fill((client.mockStatus?.enabled ?? false) ? Color.green : Color.secondary.opacity(0.5))
-                        .frame(width: 6, height: 6)
-                    Text(mockSummary)
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-            }
-
             Section("其他") {
                 HStack {
                     Label("透传连接", systemImage: "lock.slash")
@@ -141,8 +142,8 @@ private struct CurrentCaptureCard: View {
         let elapsed: Int64? = (client.stats.capturing && client.stats.startedAt > 0)
             ? max(0, Int64(nowTick.timeIntervalSince1970 * 1000) - client.stats.startedAt)
             : nil
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 6) {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 4) {
                 Circle()
                     .fill(client.stats.capturing ? .green : .gray)
                     .frame(width: 8, height: 8)
@@ -164,7 +165,7 @@ private struct CurrentCaptureCard: View {
                 statCell("透传", "\(client.stats.passthrough)")
             }
         }
-        .padding(10)
+        .padding(8)
         .background(Color(nsColor: .controlBackgroundColor))
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .onReceive(timer) { t in nowTick = t }
@@ -195,8 +196,8 @@ private struct StatsBar: View {
             }
             statRow("本地已同步", "\(client.exchanges.count) 条")
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
         .background(.bar)
     }
 

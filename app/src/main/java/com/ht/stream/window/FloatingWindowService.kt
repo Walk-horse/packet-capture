@@ -853,10 +853,22 @@ private fun PanelRow(e: HttpExchange, onClick: () -> Unit) {
         }
         Spacer(Modifier.width(8.dp))
         Column(Modifier.weight(1f)) {
-            Text(
-                e.host, color = Color(0xFFE8EAED), fontSize = 12.sp,
-                maxLines = 1, overflow = TextOverflow.Ellipsis
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                // 模拟接口标识：命中「接口模拟」规则返回的响应（与主列表一致，紫色「模拟」）
+                if (e.mocked) {
+                    Text(
+                        "模拟",
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF7B1FA2)
+                    )
+                    Spacer(Modifier.width(4.dp))
+                }
+                Text(
+                    e.host, color = Color(0xFFE8EAED), fontSize = 12.sp,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis
+                )
+            }
             if (e.path.isNotEmpty()) {
                 Text(
                     e.path.substringBefore('?'), color = PanelSub, fontSize = 10.sp,

@@ -9,9 +9,11 @@ struct ContentView: View {
     @State private var selectedRuleId: String?
     @State private var search = ""
     @State private var showConfig = false
+    /// 默认三栏全部展开（左侧导航不折叠）
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
     var body: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
             SidebarView(panel: $panel)
         } content: {
             if panel == .mock {
@@ -109,6 +111,20 @@ struct ContentView: View {
                 }
                 .controlSize(.small)
                 .help("手动同步（仅拉取新增请求）")
+
+                Button {
+                    Task { await client.reconnect() }
+                } label: {
+                    if client.reconnecting {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                    }
+                }
+                .controlSize(.small)
+                .help("一键重联移动端：重启 adb → 探测设备 → 重建转发 → 重连推送并补拉")
+                .disabled(client.reconnecting)
 
                 Button {
                     client.clearLocal()

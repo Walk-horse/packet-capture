@@ -17,7 +17,8 @@ struct BodyView: View {
     let truncated: Bool
 
     @State private var mode: Mode = .text
-    @State private var prettyOn = false
+    /// 文本视图默认按 JSON 美化显示（可手动关闭）
+    @State private var prettyOn = true
     @State private var decoded: String?
     @State private var pretty: String?
     @State private var hex: String?
@@ -25,6 +26,8 @@ struct BodyView: View {
     @State private var query = ""
     @State private var matchIndex = 0
     @State private var matchCount = 0
+    /// 精确匹配：开启后要求命中为独立词（前后非字母/数字/_），且区分大小写。
+    @State private var exactMatch = false
     @State private var working = false
 
     enum Mode: String, CaseIterable, Identifiable {
@@ -51,10 +54,10 @@ struct BodyView: View {
                 Button("保存") { save() }
             }
             .font(.system(size: 11))
-            .padding(8)
+            .padding(6)
 
             // 信息（左）+ 搜索框（右）
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 if mode == .text, looksLikeJSON {
                     Toggle("JSON 美化", isOn: $prettyOn)
                         .toggleStyle(.checkbox)
@@ -91,9 +94,13 @@ struct BodyView: View {
                     Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
                     TextField("搜索", text: $query)
                         .textFieldStyle(.roundedBorder)
-                        .frame(width: 200)
-                if !query.isEmpty {
-                    let count = searchMatchCount
+                        .frame(width: 160)
+                    Toggle("精确", isOn: $exactMatch)
+                        .toggleStyle(.checkbox)
+                        .font(.system(size: 11))
+                        .help("精确匹配：仅命中独立字段名/值，区分大小写")
+                    if !query.isEmpty {
+                        let count = searchMatchCount
                         Text(count == 0 ? "0/0" : "\(min(matchIndex + 1, count))/\(count)")
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary)
@@ -110,8 +117,8 @@ struct BodyView: View {
                 }
             }
             .font(.system(size: 11))
-            .padding(.horizontal, 8)
-            .padding(.bottom, 8)
+            .padding(.horizontal, 6)
+            .padding(.bottom, 6)
 
             Divider()
 
@@ -143,14 +150,14 @@ struct BodyView: View {
             placeholder("空 body")
         } else if mode == .hex {
             if let hex {
-                LargeTextView(text: hex, query: query, matchIndex: matchIndex, matchCount: $matchCount)
+                LargeTextView(text: hex, query: query, exactMatch: exactMatch, matchIndex: matchIndex, matchCount: $matchCount)
             } else {
                 ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         } else if mode == .json {
             jsonContent
         } else if let d = decoded {
-            LargeTextView(text: pretty ?? d, query: query, matchIndex: matchIndex, matchCount: $matchCount)
+            LargeTextView(text: pretty ?? d, query: query, exactMatch: exactMatch, matchIndex: matchIndex, matchCount: $matchCount)
         } else if working {
             ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
@@ -162,7 +169,7 @@ struct BodyView: View {
     private var jsonContent: some View {
         if let root = jsonRoot {
             // 全量树 + 命中片段淡黄高亮，与「文本」视图内容一致
-            JsonTreeView(root: root, query: query)
+            JsonTreeView(root: root, query: query, exactMatch: exactMatch)
         } else if working {
             ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if !looksLikeJSON {
@@ -178,15 +185,17 @@ struct BodyView: View {
         return pretty ?? decoded ?? (decodeText(data) ?? "")
     }
 
-    /// 统一搜索命中数（大小写不敏感、不重叠计数），文本 / JSON树 两种模式共用同一基准 → 结果一致
+    /// 统一搜索命中数（不重叠计数），文本 / JSON树 两种模式共用同一基准 → 结果一致
     private var searchMatchCount: Int {
         guard !query.isEmpty else { return 0 }
-        var count = 0
-        var start = searchBaseText.startIndex
         let s = searchBaseText
-        while let r = s.range(of: query, options: [.caseInsensitive, .diacriticInsensitive], range: start..<s.endIndex) {
-            count += 1
+        let options: String.CompareOptions = exactMatch ? [.literal] : [.caseInsensitive, .diacriticInsensitive]
+        var count = 0
+        var start = s.startIndex
+        while let r = s.range(of: query, options: options, range: start..<s.endIndex) {
             start = r.upperBound
+            if exactMatch, !isWordBoundaryMatch(s, r) { continue }
+            count += 1
             if count >= 5000 { break }
         }
         return count
@@ -196,6 +205,21 @@ struct BodyView: View {
         let count = searchMatchCount
         guard count > 0 else { return }
         matchIndex = (matchIndex + dir + count) % count
+    }
+
+    /// 判断命中区间在精确模式下是否为独立词（前后非字母/数字/_）
+    private func isWordBoundaryMatch(_ s: String, _ r: Range<String.Index>) -> Bool {
+        let wordChars = CharacterSet.alphanumerics.union(.init(charactersIn: "_"))
+        if r.lowerBound != s.startIndex {
+            let prev = s.index(before: r.lowerBound)
+            let prevSet = CharacterSet(charactersIn: String(s[prev]))
+            if wordChars.isSuperset(of: prevSet) { return false }
+        }
+        if r.upperBound != s.endIndex {
+            let nextSet = CharacterSet(charactersIn: String(s[r.upperBound]))
+            if wordChars.isSuperset(of: nextSet) { return false }
+        }
+        return true
     }
 
     private func placeholder(_ text: String) -> some View {
@@ -219,12 +243,19 @@ struct BodyView: View {
     }
 
     private func prepareText() async {
-        guard decoded == nil else { return }
-        if data.isEmpty { decoded = ""; return }
-        working = true
-        defer { working = false }
-        let d = data
-        decoded = await Task.detached(priority: .userInitiated) { decodeText(d) }.value
+        if decoded == nil {
+            if data.isEmpty {
+                decoded = ""
+            } else {
+                working = true
+                defer { working = false }
+                let d = data
+                decoded = await Task.detached(priority: .userInitiated) { decodeText(d) }.value
+            }
+        }
+        // prettyOn 默认 true：解码就绪后立即美化。
+        // `.task(id: prettyOn)` 会与 `.task(id: key)` 并发，可能在 decoded 就绪前就返回，故此处兜底。
+        if prettyOn { await preparePretty() }
     }
 
     private func prepareHex() async {

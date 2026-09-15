@@ -12,9 +12,20 @@ struct MockEditorView: View {
     @State private var pushMsg: String?
     @State private var pushing = false
     @State private var showYapi = false
-    /// 勾选后：示例里的 JSON 自动按缩进美化（不改变字段顺序）
-    @AppStorage("mock.autoPrettyJson") private var autoPrettyJson = false
-    @FocusState private var bodyFocused: Bool
+    /// 勾选后：示例里的 JSON 自动按缩进美化（不改变字段顺序）。默认开启。
+    @AppStorage("mock.autoPrettyJson") private var autoPrettyJson = true
+    /// 响应示例视图模式：文本 / JSON 树
+    @State private var bodyMode: MockBodyMode = .text
+    /// JSON 树的可编辑模型（进入树模式时由 body 解析得到，树编辑回写 body）
+    @State private var treeRoot: EditJsonNode?
+    /// 树中选中的节点（在底部输入框编辑，避免就地编辑）
+    @State private var selectedNode: EditJsonNode?
+    /// 搜索词与匹配状态（文本 / 树模式共用搜索框）
+    @State private var query = ""
+    @State private var matchIndex = 0
+    @State private var matchCount = 0
+    /// 精确匹配：开启后要求命中为独立词，区分大小写。
+    @State private var exactMatch = false
 
     var body: some View {
         Group {
@@ -33,14 +44,32 @@ struct MockEditorView: View {
         }
         .task(id: ruleId) {
             draft = store.rule(ruleId)
+            treeRoot = nil
+            selectedNode = nil
+            bodyMode = .text
+            query = ""; matchIndex = 0; matchCount = 0; exactMatch = false
             if autoPrettyJson { _ = prettyBody(quiet: true) }
         }
         .onChange(of: autoPrettyJson) { on in
             if on { _ = prettyBody(quiet: true) }
         }
-        .onChange(of: bodyFocused) { focused in
-            // 编辑结束后（失焦）再美化，避免打字过程中光标跳动
-            if !focused, autoPrettyJson { _ = prettyBody(quiet: true) }
+        .onChange(of: query) { q in
+            // 树模式下由父视图统计命中数（文本模式由 EditableTextView 上报）
+            if bodyMode == .tree {
+                matchCount = q.isEmpty ? 0 : countMatches(in: treeText ?? "", query: q, exact: exactMatch)
+            }
+        }
+        .onChange(of: exactMatch) { _ in
+            if bodyMode == .tree {
+                matchCount = query.isEmpty ? 0 : countMatches(in: treeText ?? "", query: query, exact: exactMatch)
+            }
+        }
+        .onChange(of: bodyMode) { mode in
+            if mode == .tree {
+                enterTreeMode()
+            } else {
+                selectedNode = nil
+            }
         }
     }
 
@@ -48,13 +77,13 @@ struct MockEditorView: View {
 
     /// 面板本身不滚动：表单项固定，只有「响应示例」编辑区吸收剩余高度并内部滚动。
     private var editor: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 10) {
             headerBlock
             matchBlock
             responseBlock
             footerBlock
         }
-        .padding(16)
+        .padding(12)
         .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .sheet(isPresented: $showYapi) {
             MockYapiSheet(
@@ -64,6 +93,7 @@ struct MockEditorView: View {
                     draft = store.rule(id)
                     showYapi = false
                     if autoPrettyJson { _ = prettyBody(quiet: true) }
+                    syncTreeFromBody()
                     pushMsg = "已从 YAPI 拉取：\(f.summary)"
                 },
                 onCancel: { showYapi = false },
@@ -76,8 +106,8 @@ struct MockEditorView: View {
     }
 
     private var headerBlock: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
                 TextField("规则备注（可选）", text: bind(\.name))
                     .textFieldStyle(.roundedBorder)
                 Toggle("启用", isOn: bind(\.enabled))
@@ -92,7 +122,7 @@ struct MockEditorView: View {
 
     private var matchBlock: some View {
         GroupBox(label: Label("匹配条件", systemImage: "line.3.horizontal.decrease.circle")) {
-            Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 10, verticalSpacing: 8) {
+            Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 8, verticalSpacing: 6) {
                 GridRow {
                     Text("方法").gridColumnAlignment(.trailing).foregroundStyle(.secondary)
                     Picker("", selection: bind(\.method)) {
@@ -125,13 +155,13 @@ struct MockEditorView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            .padding(.top, 4)
+            .padding(.top, 2)
         }
     }
 
     private var responseBlock: some View {
         GroupBox(label: Label("模拟响应", systemImage: "arrow.turn.down.right")) {
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 10) {
                     Text("状态码").foregroundStyle(.secondary)
                     TextField("200", value: bind(\.statusCode), format: .number)
@@ -205,16 +235,52 @@ struct MockEditorView: View {
                     Button("从抓包填充") { fillFromCapture(useOriginal: true) }
                         .controlSize(.small)
                         .help("直接用抓包到的响应原文作为示例")
-                    Button("清空") { set(\.body, ""); set(\.yapiId, nil); pushMsg = "已清空：将由手机端自动生成示例" }
+                    Button("清空") { set(\.body, ""); set(\.yapiId, nil); syncTreeFromBody(); pushMsg = "已清空：将由手机端自动生成示例" }
                         .controlSize(.small)
                 }
 
-                TextEditor(text: bind(\.body))
-                    .font(.system(size: 11.5, design: .monospaced))
-                    .focused($bodyFocused)
-                    .frame(minHeight: 120)
-                    .frame(maxHeight: .infinity)   // 吸收剩余高度，滚动条落在这里
-                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.primary.opacity(0.15)))
+                // 视图模式 + 搜索 工具条
+                HStack(spacing: 8) {
+                    Picker("", selection: $bodyMode) {
+                        ForEach(MockBodyMode.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 160)
+                    .help("文本：直接编辑；JSON 树：只读查看，点击节点后在下方输入框编辑")
+
+                    Spacer()
+
+                    HStack(spacing: 4) {
+                        Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                        TextField("搜索", text: $query)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 160)
+                        Toggle("精确", isOn: $exactMatch)
+                            .toggleStyle(.checkbox)
+                            .font(.system(size: 11))
+                            .help("精确匹配：仅命中独立字段名/值，区分大小写")
+                        if !query.isEmpty {
+                            Text(matchCount == 0 ? "0/0" : "\(min(matchIndex + 1, matchCount))/\(matchCount)")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                            if bodyMode == .text {
+                                Button { stepMatch(-1) } label: { Image(systemName: "chevron.up").resizable().frame(width: 8, height: 8) }
+                                    .frame(width: 18, height: 18)
+                                    .help("上一个匹配")
+                                Button { stepMatch(1) } label: { Image(systemName: "chevron.down").resizable().frame(width: 8, height: 8) }
+                                    .frame(width: 18, height: 18)
+                                    .help("下一个匹配")
+                            }
+                        }
+                    }
+                }
+
+                // 编辑区：文本 / JSON 树
+                bodyEditorArea
+
+                // 选中节点的底部编辑框（树模式专用，替代就地编辑）
+                selectedNodeEditor
 
                 HStack(spacing: 8) {
                     Text(bodySizeText)
@@ -327,6 +393,7 @@ struct MockEditorView: View {
         }
         guard out != d.body else { return true }   // 已经美化过，不写回（避免失焦时反复触发存储写入）
         set(\.body, out)
+        syncTreeFromBody()
         if !quiet { pushMsg = "已按 JSON 美化（保留字段原有顺序）" }
         return true
     }
@@ -348,7 +415,171 @@ struct MockEditorView: View {
             return
         }
         set(\.body, out)
+        syncTreeFromBody()
         pushMsg = "已压缩为单行 JSON"
+    }
+
+    // MARK: - 响应示例：文本 / JSON 树 编辑
+
+    private enum MockBodyMode: String, CaseIterable, Identifiable {
+        case text = "文本"
+        case tree = "JSON 树"
+        var id: String { rawValue }
+    }
+
+    /// 编辑区：根据 bodyMode 切换可编辑文本视图 / 可编辑 JSON 树。
+    @ViewBuilder
+    private var bodyEditorArea: some View {
+        if bodyMode == .text {
+            EditableTextView(
+                text: bind(\.body),
+                fontSize: 11.5,
+                query: query,
+                exactMatch: exactMatch,
+                matchIndex: $matchIndex,
+                matchCount: $matchCount,
+                onEditingEnded: {
+                    if autoPrettyJson { _ = prettyBody(quiet: true) }
+                }
+            )
+            .frame(minHeight: 120)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)   // 吸收剩余空间，确保文本可见
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.primary.opacity(0.15)))
+        } else if let root = treeRoot {
+            EditableJsonTreeView(
+                root: root,
+                query: query,
+                selectedId: selectedNode?.id,
+                onSelect: { selectedNode = $0 }
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.primary.opacity(0.15)))
+        } else {
+            Text("示例不是合法 JSON，已切回文本模式")
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    /// 选中节点后的底部编辑框：树模式专用。
+    /// 叶子节点编辑「值」（原样文本，自动识别类型）；object 子项额外可编辑「键」。
+    /// 容器节点仅展示摘要、不可直接编辑。
+    @ViewBuilder
+    private var selectedNodeEditor: some View {
+        if bodyMode == .tree, let sel = selectedNode {
+            HStack(spacing: 8) {
+                Image(systemName: "pencil").foregroundStyle(.secondary).font(.system(size: 11))
+                if sel.isObjectEntry {
+                    TextField("键", text: Binding(
+                        get: { sel.keyName },
+                        set: { sel.keyName = $0; treeChanged() }
+                    ))
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 150)
+                }
+                if sel.isContainer {
+                    Text(sel.kind == .object ? "对象（含 \(sel.entries.count) 个字段）" : "数组（含 \(sel.items.count) 个元素）")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                } else {
+                    TextField("值（原样文本，自动识别类型）", text: Binding(
+                        get: { sel.editText },
+                        set: { sel.setEditText($0); treeChanged() }
+                    ))
+                    .textFieldStyle(.roundedBorder)
+                }
+                Button {
+                    selectedNode = nil
+                } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("取消选择")
+                Spacer()
+            }
+            .padding(.top, 4)
+        }
+    }
+
+    /// 树编辑回写：序列化可编辑节点为保序 JSON 写回 body，并刷新搜索命中数。
+    private func treeChanged() {
+        guard let root = treeRoot else { return }
+        let s = serializeJson(root, pretty: true)
+        set(\.body, s)
+        if !query.isEmpty { matchCount = countMatches(in: s, query: query, exact: exactMatch) }
+    }
+
+    /// 进入树模式：解析当前 body 为可编辑节点；非法 / 空 JSON 时回退文本模式并提示。
+    private func enterTreeMode() {
+        selectedNode = nil
+        guard let d = draft else { return }
+        let text = d.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else {
+            pushMsg = "示例为空，无法用树编辑：先填写，或用「按响应类型生成 / 从抓包填充」"
+            bodyMode = .text
+            return
+        }
+        guard let jn = parseOrderedJSON(text) else {
+            pushMsg = "当前示例不是合法 JSON，无法用树编辑（切回文本修正后重试）"
+            bodyMode = .text
+            return
+        }
+        treeRoot = EditJsonNode.from(jn)
+        if !query.isEmpty { matchCount = countMatches(in: text, query: query, exact: exactMatch) }
+    }
+
+    /// 外部改写 body（生成 / 填充 / 清空 / 美化）后，若处于树模式则同步刷新树。
+    private func syncTreeFromBody() {
+        guard bodyMode == .tree else { return }
+        selectedNode = nil
+        guard let d = draft else { return }
+        let text = d.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.isEmpty { treeRoot = nil; return }
+        guard let jn = parseOrderedJSON(text) else { bodyMode = .text; treeRoot = nil; return }
+        treeRoot = EditJsonNode.from(jn)
+        if !query.isEmpty { matchCount = countMatches(in: text, query: query, exact: exactMatch) }
+    }
+
+    /// 树模式下序列化后的文本（搜索计数基准）
+    private var treeText: String? {
+        guard let root = treeRoot else { return nil }
+        return serializeJson(root, pretty: true)
+    }
+
+    /// 统一搜索命中数（不重叠计数，上限 5000）
+    private func countMatches(in text: String, query q: String, exact: Bool) -> Int {
+        guard !q.isEmpty else { return 0 }
+        let options: String.CompareOptions = exact ? [.literal] : [.caseInsensitive, .diacriticInsensitive]
+        var count = 0
+        var start = text.startIndex
+        let s = text
+        while let r = s.range(of: q, options: options, range: start..<s.endIndex) {
+            start = r.upperBound
+            if exact, !isMockWordBoundaryMatch(s, r) { continue }
+            count += 1
+            if count >= 5000 { break }
+        }
+        return count
+    }
+
+    /// 判断命中区间在精确模式下是否为独立词（前后非字母/数字/_）
+    private func isMockWordBoundaryMatch(_ s: String, _ r: Range<String.Index>) -> Bool {
+        let wordChars = CharacterSet.alphanumerics.union(.init(charactersIn: "_"))
+        if r.lowerBound != s.startIndex {
+            let prev = s.index(before: r.lowerBound)
+            let prevSet = CharacterSet(charactersIn: String(s[prev]))
+            if wordChars.isSuperset(of: prevSet) { return false }
+        }
+        if r.upperBound != s.endIndex {
+            let nextSet = CharacterSet(charactersIn: String(s[r.upperBound]))
+            if wordChars.isSuperset(of: nextSet) { return false }
+        }
+        return true
+    }
+
+    private func stepMatch(_ dir: Int) {
+        guard matchCount > 0 else { return }
+        matchIndex = (matchIndex + dir + matchCount) % matchCount
     }
 
     // MARK: - 绑定与动作
@@ -410,6 +641,7 @@ struct MockEditorView: View {
         let template = matchedCapture()?.responseData
         let sample = MockSample.generate(contentType: d.contentType, template: template)
         set(\.body, autoPrettied(sample))
+        syncTreeFromBody()
         pushMsg = template == nil ? "已按 Content-Type 生成示例" : "已按抓到的响应结构生成示例"
     }
 
@@ -426,6 +658,7 @@ struct MockEditorView: View {
             return
         }
         set(\.body, autoPrettied(text))
+        syncTreeFromBody()
         pushMsg = useOriginal ? "已用抓包响应原文填充" : "已填充"
     }
 }
