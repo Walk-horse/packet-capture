@@ -36,7 +36,7 @@ struct SyncConfigView: View {
             .buttonStyle(.borderedProminent)
             .controlSize(.regular)
             .disabled(client.reconnecting)
-            .help("重启 adb server → 探测设备 → 重建转发 → 重连推送并全量补拉")
+            .help("探测设备 → 重建转发 → 手机端服务探活（无响应则自动冷启动 App）→ 重连推送并全量补拉")
 
             // 手机地址
             VStack(alignment: .leading, spacing: 6) {

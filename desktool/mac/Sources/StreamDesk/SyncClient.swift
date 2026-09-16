@@ -519,39 +519,33 @@ final class SyncClient: ObservableObject {
             return
         }
 
-        // 1) 重启 adb server：修复 USB 授权丢失 / 守护进程僵死导致 forward 规则无效
-        Self.logLine("[1/4] 重启 adb server…")
-        _ = try? Self.runAdb(["kill-server"], adb: adb)
-        do {
-            _ = try Self.runAdb(["start-server"], adb: adb)
-            Self.logLine("    adb server 已重启")
-        } catch {
-            Self.logLine("    adb start-server 失败：\(friendly(error))")
+        // 1) 探测设备。注意：adb server 活着就**不要** kill-server——重启会掐掉正常链路，
+        //    且重启后设备重新枚举需要数秒，立刻探测会误判「无设备」直接终止（已踩过）。
+        Self.logLine("[1/5] 探测 USB 设备…")
+        var serial = await Self.waitForDevice(adb: adb, seconds: 3)
+        if serial == nil {
+            // adb server 可能僵死：这时才重启，并**轮询等待**设备重新枚举（MIUI 重新授权也可能耗时）
+            Self.logLine("    未见设备 → 重启 adb server 后继续等待…")
+            _ = try? Self.runAdb(["kill-server"], adb: adb)
+            _ = try? Self.runAdb(["start-server"], adb: adb)
+            Self.logLine("    adb server 已重启，等待设备重新枚举…")
+            serial = await Self.waitForDevice(adb: adb, seconds: 10)
         }
-
-        // 2) 探测设备：确认 USB 物理层正常 + 已授权（这里能暴露插拔/锁屏导致的掉线）
-        Self.logLine("[2/4] 探测 USB 设备…")
-        var serial = selectedSerial
-        let list = (try? Self.runAdb(["devices", "-l"], adb: adb)).map { Self.parseDeviceList($0) } ?? []
-        if let s = serial, list.contains(where: { $0.serial == s }) {
-            Self.logLine("    沿用已选设备 \(s)")
-        } else if let first = list.first {
-            serial = first.serial
-            selectedSerial = serial
-            Self.logLine("    自动选用设备 \(serial ?? "")")
-        } else {
+        guard let dev = serial else {
             status = .failed("未发现已授权的 USB 设备（请检查 USB 连接与调试授权）")
-            Self.logLine("    无可用 USB 设备，重联终止")
+            Self.logLine("[x] 等待后仍无可用 USB 设备，重联终止")
             return
         }
+        if dev != selectedSerial { selectedSerial = dev }
+        Self.logLine("    使用设备 \(dev)")
 
-        // 3) 重建 adb forward：移除旧规则（USB 断连后规则往往已失效/残留）后按设备重建
-        Self.logLine("[3/4] 重建 adb forward…")
+        // 2) 重建 adb forward：移除旧规则（USB 断连后规则往往已失效/残留）后按设备重建
+        Self.logLine("[2/5] 重建 adb forward…")
         let port = Self.port(from: address) ?? 17890
         _ = try? Self.runAdb(["forward", "--remove", "tcp:\(port)"], adb: adb)
-        let ok = (try? Self.runAdb(["-s", serial!, "forward", "tcp:\(port)", "tcp:17890"], adb: adb)) != nil
+        let ok = (try? Self.runAdb(["-s", dev, "forward", "tcp:\(port)", "tcp:17890"], adb: adb)) != nil
         if ok {
-            Self.logLine("    forward tcp:\(port) → \(serial!):tcp:17890 已建立")
+            Self.logLine("    forward tcp:\(port) → \(dev):tcp:17890 已建立")
         } else {
             Self.logLine("    带 -s 建立失败，尝试不带 -s 兜底")
             let ok2 = (try? Self.runAdb(["forward", "tcp:\(port)", "tcp:17890"], adb: adb)) != nil
@@ -562,10 +556,96 @@ final class SyncClient: ObservableObject {
             }
         }
 
-        // 4) 重连 WS + 全量补拉：本地空则全量已在 resetAndPull 内处理，这里统一全量拉一次以恢复列表
-        Self.logLine("[4/4] 重连推送通道并全量补拉…")
+        // 3) 手机端服务探活：GET / 自检接口（**不消费 synced 标志位**）。
+        //    adb 链路通 ≠ 手机端服务在跑——App 活着但 17890 未监听时（同步开关被关/服务线程死了），
+        //    forward 转发会被手机端拒绝，客户端表现为「空回复 / 连接丢失」。
+        Self.logLine("[3/5] 手机端服务探活…")
+        if await Self.probeService(address: address, tries: 2) {
+            Self.logLine("    手机端服务正常")
+        } else {
+            // 4) 手机端服务没起 → adb 冷启动 App（force-stop + autostart + sync_on）再等恢复
+            Self.logLine("    手机端服务无响应 → 尝试冷启动抓包 App…")
+            let revived = await Self.revivePhoneService(adb: adb, serial: dev, address: address)
+            if !revived {
+                status = .failed("adb 链路已通，但手机端同步服务无法恢复（请在 App 内检查同步开关）")
+                Self.logLine("[x] 冷启动后手机端服务仍无响应，重联终止")
+                return
+            }
+            Self.logLine("    手机端服务已恢复")
+        }
+
+        // 5) 重连 WS + 全量补拉：本地空则全量已在 resetAndPull 内处理，这里统一全量拉一次以恢复列表
+        Self.logLine("[5/5] 重连推送通道并全量补拉…")
         connectWs()
         await resetAndPull()
+    }
+
+    /// 轮询等待已授权设备出现（每 0.5s 探一次）。adb server 重启后设备重新枚举需要时间，
+    /// 不能只探一次就判死。返回第一个可用设备 serial。
+    private nonisolated static func waitForDevice(adb: String, seconds: Double) async -> String? {
+        let deadline = Date().addingTimeInterval(seconds)
+        while true {
+            if let out = try? runAdb(["devices", "-l"], adb: adb),
+               let first = parseDeviceList(out).first {
+                return first.serial
+            }
+            if Date() >= deadline { return nil }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+    }
+
+    /// 手机端服务探活：请求自检接口 `GET /`（不消费 synced），2~3s 超时。
+    private nonisolated static func probeService(address: String, tries: Int) async -> Bool {
+        var base = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !base.hasPrefix("http://") && !base.hasPrefix("https://") { base = "http://" + base }
+        base = base.replacingOccurrences(of: "/api/state", with: "")
+        base = base.replacingOccurrences(of: "/api/mock", with: "")
+        while base.hasSuffix("/") { base.removeLast() }
+        guard let url = URL(string: base + "/") else { return false }
+        for _ in 0..<max(1, tries) {
+            var req = URLRequest(url: url, timeoutInterval: 3)
+            req.cachePolicy = .reloadIgnoringLocalCacheData
+            if let (_, resp) = try? await URLSession.shared.data(for: req),
+               let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) {
+                return true
+            }
+            if tries > 1 { try? await Task.sleep(nanoseconds: 400_000_000) }
+        }
+        return false
+    }
+
+    /// 冷启动手机端抓包 App：同步服务没在跑（App 活着但 17890 未监听）时的最后一招。
+    /// debug 包优先；force-stop 后 `am start --ez autostart/sync_on true`（仅 onCreate 读 extras，冷启动场景有效）。
+    private nonisolated static func revivePhoneService(adb: String, serial: String, address: String) async -> Bool {
+        let packages = ["com.ht.stream.debug", "com.ht.stream"]
+        var target: String?
+        for pkg in packages { // 优先挑活着的进程
+            let pids = ((try? runAdb(["-s", serial, "shell", "pidof", pkg], adb: adb)) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !pids.isEmpty { target = pkg; break }
+        }
+        if target == nil {
+            for pkg in packages { // 都没进程则挑已安装的
+                if let out = try? runAdb(["-s", serial, "shell", "pm", "list", "packages", pkg], adb: adb),
+                   out.contains(pkg) { target = pkg; break }
+            }
+        }
+        guard let pkg = target else {
+            logLine("    未在手机上找到抓包 App（com.ht.stream.debug / com.ht.stream）")
+            return false
+        }
+        logLine("    冷启动 \(pkg)（force-stop + autostart + sync_on）…")
+        _ = try? runAdb(["-s", serial, "shell", "am", "force-stop", pkg], adb: adb)
+        _ = try? runAdb(["-s", serial, "shell", "am", "start",
+                         "-n", "\(pkg)/com.ht.stream.MainActivity",
+                         "--ez", "autostart", "true", "--ez", "sync_on", "true"], adb: adb)
+        // 等服务起来（App 冷启动 + SyncServer 监听需要几秒）
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline {
+            if await probeService(address: address, tries: 1) { return true }
+            try? await Task.sleep(nanoseconds: 600_000_000)
+        }
+        return false
     }
 
     /// 地址是否指向本机回环（只有这种地址才靠 adb forward，才值得自愈）
