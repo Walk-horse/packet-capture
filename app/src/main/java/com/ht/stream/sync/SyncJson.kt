@@ -71,6 +71,22 @@ object SyncJson {
         return obj
     }
 
+    /** WS 状态变更推送：抓包开始 / 停止时立即下发，让桌面端实时刷新「正在抓包」指示，
+     *  不依赖桌面端轮询（autoSync 关闭时也能即时更新）。不含请求列表，仅带最新统计。 */
+    fun wsStatus(): JSONObject {
+        val obj = JSONObject()
+        obj.put("type", "status")
+        obj.put("capturing", CaptureVpnService.running.value)
+        obj.put("uploadBytes", RequestStore.uploadBytes.get())
+        obj.put("downloadBytes", RequestStore.downloadBytes.get())
+        obj.put("requestCount", RequestStore.exchanges.value.size)
+        obj.put("passthroughCount", RequestStore.passthrough.value.size)
+        obj.put("startedAt", CaptureVpnService.startedAt.value)
+        obj.put("exchanges", JSONArray())
+        obj.put("passthrough", JSONArray())
+        return obj
+    }
+
     private fun sessions(): JSONArray = JSONArray().apply {
         RequestStore.sessions.value.forEach { s ->
             val o = JSONObject()

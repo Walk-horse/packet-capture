@@ -15,6 +15,7 @@ import com.ht.stream.data.CaptureMode
 import com.ht.stream.data.FileLogger
 import com.ht.stream.data.RequestStore
 import com.ht.stream.proxy.LocalProxyServer
+import com.ht.stream.sync.SyncServer
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import java.io.FileInputStream
@@ -109,6 +110,8 @@ class CaptureVpnService : VpnService() {
         active = true
         _running.value = true
         _startedAt.value = System.currentTimeMillis()
+        // 立即通知已连接的桌面端：抓包已开始（实时刷新「正在抓包」指示）
+        SyncServer.broadcastStatus()
 
         readerThread = Thread({ readLoop(fd) }, "tun-reader").apply { isDaemon = true }
         readerThread?.start()

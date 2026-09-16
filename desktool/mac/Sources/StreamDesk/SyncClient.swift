@@ -408,6 +408,19 @@ final class SyncClient: ObservableObject {
     /// 应用 WS 消息：snapshot 与 delta 统一按增量并入（按 id 去重）。
     /// 手机端 snapshot 现在只发「尚未同步」的子集，不再整体替换，避免清屏/重连后误删本地已展示记录。
     private func applyWs(_ msg: WsMessage) {
+        // 状态变更推送（type:"status"）：抓包开始/停止时手机端主动下发，仅刷新统计卡
+        //（capturing / startedAt / 流量计数），不动请求列表。即便 autoSync 关闭也能即时更新。
+        if msg.type == "status" {
+            stats = Stats(
+                capturing: msg.capturing,
+                upload: msg.uploadBytes,
+                download: msg.downloadBytes,
+                requests: msg.requestCount,
+                passthrough: msg.passthroughCount,
+                startedAt: msg.startedAt
+            )
+            return
+        }
         stats = Stats(
             capturing: msg.capturing,
             upload: msg.uploadBytes,

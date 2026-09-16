@@ -407,6 +407,18 @@ object SyncServer {
         }
     }
 
+    /** 抓包状态变更（开始 / 停止）立即广播：桌面端 WS 收到后即时刷新「正在抓包」指示，
+     *  不依赖桌面端轮询（autoSync 关闭也不受影响）。
+     *  无存活 WS 客户端时直接返回：本推送只发状态、不取请求数据，因此即便返回也不影响 synced 标志位。 */
+    fun broadcastStatus() {
+        if (wsClients.none { it.alive }) return
+        val json = runCatching { SyncJson.wsStatus().toString() }.getOrNull() ?: return
+        val snapshot = synchronized(wsClients) { wsClients.toList() }
+        for (client in snapshot) {
+            if (client.alive) client.send(json)
+        }
+    }
+
     private class WsClient(val socket: Socket, private val out: OutputStream) {
         @Volatile var alive = true
         private val lock = Any()
