@@ -19,6 +19,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import org.json.JSONArray
@@ -38,7 +39,8 @@ import org.json.JSONTokener
  *  - GET /                   服务自检
  *  - GET /api/ws  (Upgrade: websocket)       移动端主动推送：连接时下发未同步快照，之后数据变化即时增量推送
  *
- * 抓包开启时本机外发流量走 TUN，但服务接收的是局域网/USB 入站连接，不受 VPN 影响。
+ * 抓包开启时本机外发流量走 TUN；同步服务仅监听 127.0.0.1（loopback），流量经 adb forward 入站，
+ * 不受 VPN 影响、也不暴露到局域网（消除同 WiFi 未授权访问风险）。
  */
 object SyncServer {
 
@@ -66,13 +68,18 @@ object SyncServer {
 
     val isRunning: Boolean get() = runningFlag.get()
 
-    /** 实际对外地址，UI 展示给用户在 Mac 端填写 */
-    val address: String get() = "${localIpv4() ?: "手机IP"}:$port"
+    /** 实际对外地址：仅 loopback（同步流量走 adb forward），UI 展示给用户经 USB 连接时填写 */
+    val address: String get() = "127.0.0.1:$port"
 
     // ---------- WebSocket 推送 ----------
     private val wsScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     @Volatile private var broadcastJob: Job? = null
+    @Volatile private var pingJob: Job? = null
     private val wsClients = Collections.synchronizedList(mutableListOf<WsClient>())
+
+    /** WS 并发上限：防止重连风暴 / 多开面板在手机端无限制新建阻塞读线程与 FD，
+     *  进而推高 adbd 侧 forward 子通道数、累积资源拖垮 adbd。 */
+    private const val MAX_WS_CLIENTS = 5
 
     @Synchronized
     fun start(preferred: Int = DEFAULT_PORT): Boolean {
@@ -84,7 +91,8 @@ object SyncServer {
             try {
                 val s = ServerSocket()
                 s.reuseAddress = true
-                s.bind(InetSocketAddress(p))
+                // 仅绑定 loopback：同步流量一律经 adb forward 入站，彻底消除「同 WiFi 任意设备可读全部明文流量」的未授权访问漏洞
+                s.bind(InetSocketAddress("127.0.0.1", p))
                 ss = s
                 usedPort = p
                 break
@@ -114,6 +122,26 @@ object SyncServer {
                 }
             }
         }
+        // 心跳探测：WS 连接设了 soTimeout=0（允许空闲），但静默掉线（合盖/切 WiFi 未发 FIN）
+        // 会让服务端 read 线程永久阻塞、占住线程与 FD；定期发 ping，发送失败即判定对端已死并回收。
+        if (pingJob == null) {
+            pingJob = wsScope.launch {
+                try {
+                    while (true) {
+                        delay(30_000)
+                        val snapshot = synchronized(wsClients) { wsClients.toList() }
+                        for (client in snapshot) {
+                            if (!client.alive) continue
+                            // 发送空 ping；对端已死时底层 write 抛异常 → alive=false
+                            client.send(wsFrame(ByteArray(0), 0x9))
+                            if (!client.alive) client.close() // 关闭 socket 使阻塞的 read 线程退出
+                        }
+                    }
+                } catch (_: Exception) {
+                    // scope 取消时结束
+                }
+            }
+        }
         return true
     }
 
@@ -122,6 +150,8 @@ object SyncServer {
         runningFlag.set(false)
         broadcastJob?.cancel()
         broadcastJob = null
+        pingJob?.cancel()
+        pingJob = null
         synchronized(wsClients) {
             wsClients.forEach { it.close() }
             wsClients.clear()
@@ -352,7 +382,8 @@ object SyncServer {
     // ================= WebSocket =================
 
     private fun handleWs(sock: Socket, key: String) {
-        sock.soTimeout = 0 // 推送通道允许空闲，不设读超时（断连由对方 FIN 触发）
+        sock.soTimeout = 0 // 推送通道允许空闲，不设读超时（断连由对方 FIN / 心跳 ping 触发）
+        runCatching { sock.keepAlive = true } // 兜底：TCP 层探测死连接
         val accept = computeAcceptKey(key)
         val handshake = buildString {
             append("HTTP/1.1 101 Switching Protocols\r\n")
@@ -363,6 +394,12 @@ object SyncServer {
         val out = sock.getOutputStream()
         out.write(handshake.toByteArray(Charsets.UTF_8))
         out.flush()
+
+        // 并发上限检查：超限直接关闭，避免僵尸线程/FD 累积拖垮手机端乃至 adbd
+        if (synchronized(wsClients) { wsClients.count { it.alive } } >= MAX_WS_CLIENTS) {
+            runCatching { sock.close() }
+            return
+        }
 
         val client = WsClient(sock, out)
         // 下发增量快照（仅尚未同步的「已落定」记录，并置已同步）
@@ -398,6 +435,7 @@ object SyncServer {
         // HTTP 增量轮询从此永远拉不到新数据（表现为桌面端清屏后不再同步）。
         if (wsClients.none { it.alive }) return
         // 与 HTTP 增量共用 synced 标志位：取 settled && !synced 并置位，桌面端按 id 去重
+        // takeExchangesForSync 默认按批上限（200）取，未同步过多时自动分批并触发后续广播，避免单条 JSON 过大 OOM
         val send = RequestStore.takeExchangesForSync(false)
         if (send.isEmpty()) return
         val json = runCatching { SyncJson.wsDelta(send).toString() }.getOrNull() ?: return

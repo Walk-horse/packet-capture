@@ -85,15 +85,19 @@ object RequestStore {
      * 整个「读取 + 置位」在 synchronized 内完成，避免 HTTP 轮询与 WS 推送重复下发同一条。
      */
     @Synchronized
-    fun takeExchangesForSync(full: Boolean): List<HttpExchange> {
+    fun takeExchangesForSync(full: Boolean, limit: Int = 200): List<HttpExchange> {
         val settled = _exchanges.value.filter { it.state != HttpExchange.State.PENDING }
         return if (full) {
             settled.forEach { it.synced = true }
             settled
         } else {
             val pending = settled.filter { !it.synced }
-            pending.forEach { it.synced = true }
-            pending
+            // 未同步记录过多（合盖/断网久未拉取）时按批取走，避免单条 JSON 过大导致手机端 OOM
+            val taken = if (limit >= pending.size) pending else pending.take(limit)
+            taken.forEach { it.synced = true }
+            // 仍有余量时主动再触发一轮广播，确保最终一致（否则停抓包后余量可能永久不被下发）
+            if (taken.size < pending.size) notifyChanged()
+            taken
         }
     }
 

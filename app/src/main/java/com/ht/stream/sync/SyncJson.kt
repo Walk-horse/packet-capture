@@ -30,7 +30,8 @@ object SyncJson {
      * @param full true=全量（返回全部并置已同步）；false=增量（仅未同步部分并置已同步）
      */
     fun state(full: Boolean): JSONObject {
-        val sendEx = RequestStore.takeExchangesForSync(full)
+        // 增量（full=false）按批上限取，避免单条 JSON 过大 OOM；全量保持完整（桌面端整体替换语义）
+        val sendEx = RequestStore.takeExchangesForSync(full, if (full) Int.MAX_VALUE else 200)
         val obj = JSONObject()
         obj.put("capturing", CaptureVpnService.running.value)
         obj.put("uploadBytes", RequestStore.uploadBytes.get())

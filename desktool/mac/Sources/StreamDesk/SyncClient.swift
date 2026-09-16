@@ -318,6 +318,9 @@ final class SyncClient: ObservableObject {
     private var wsGeneration = 0
     /// WS 连续失败次数（成功即清零）：连续失败才触发 adb forward 自愈
     private var wsFailStreak = 0
+    /// WS 重连退避（纳秒）：失败按 1→2→4→8… 指数增长，上限 30s；成功/主动重连即归零。
+    /// 固定 3s 重连在手机端静默掉线时会产生短连接风暴，推高 adbd 侧 forward 子通道与手机端线程。
+    private var wsBackoff: UInt64 = 1_000_000_000
 
     /// 连接手机端 WS 推送通道（ws://<addr>/api/ws）。
     /// 原 HTTP 轮询通道保持不变，WS 仅作为实时增量补充；断线自动重连。
@@ -373,6 +376,7 @@ final class SyncClient: ObservableObject {
                     }
                 case .success(let msg):
                     self.wsFailStreak = 0
+                    self.wsBackoff = 1_000_000_000 // 连上即归零退避
                     if case .string(let text) = msg {
                         self.handleWsText(text)
                     }
