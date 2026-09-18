@@ -19,8 +19,10 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.platform.LocalContext
 import com.ht.stream.capture.CaptureVpnService
+import com.ht.stream.data.MockStore
 import com.ht.stream.data.RequestStore
 import com.ht.stream.sync.SyncPrefs
 import com.ht.stream.sync.SyncServer
@@ -41,6 +43,8 @@ import com.ht.stream.ui.StreamTheme
 import com.ht.stream.ui.ToolsScreen
 import com.ht.stream.ui.WindowPickScreen
 import com.ht.stream.window.FloatingWindowService
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /** 页面导航模型（栈式） */
 sealed interface Screen {
@@ -55,6 +59,7 @@ sealed interface Screen {
     data object Hosts : Screen
     data object Tools : Screen
     data object Mock : Screen
+    data class MockDetail(val ruleId: String) : Screen
     data object Https : Screen
     data object CaptureMode : Screen
     data object Logs : Screen
@@ -136,6 +141,7 @@ fun Root() {
     // ---------- 窗口化 ----------
     val pendingWindow = remember { mutableStateOf<LaunchApp?>(null) }
     val ensureHolder = remember { arrayOfNulls<((LaunchApp) -> Unit)>(1) }
+    val windowScope = rememberCoroutineScope()
 
     fun launchWindowNow(app: LaunchApp) {
         (context as? MainActivity)?.markWindowLaunched()
@@ -145,6 +151,21 @@ fun Root() {
             runCatching { context.startActivity(li) }
         }
         (context as? Activity)?.moveTaskToBack(true)
+    }
+
+    /** 窗口化启动必须等 VPN 真正建立，否则目标 App 的首批 H5 请求会绕过 TUN。 */
+    fun launchWindowWhenReady(app: LaunchApp) {
+        windowScope.launch {
+            val deadline = System.currentTimeMillis() + 8_000L
+            while (!CaptureVpnService.running.value && System.currentTimeMillis() < deadline) {
+                delay(50L)
+            }
+            if (CaptureVpnService.running.value) {
+                launchWindowNow(app)
+            } else {
+                Toast.makeText(context, "抓包服务启动超时，请重试", Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 
     val overlayPermission = rememberLauncherForActivityResult(
@@ -158,7 +179,7 @@ fun Root() {
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
             startCapture(context)
-            pendingWindow.value?.let { launchWindowNow(it) }
+            pendingWindow.value?.let { launchWindowWhenReady(it) }
         }
         pendingWindow.value = null
     }
@@ -185,6 +206,8 @@ fun Root() {
                 return
             }
             startCapture(context)
+            launchWindowWhenReady(app)
+            return
         }
         launchWindowNow(app)
     }
@@ -243,7 +266,18 @@ fun Root() {
         )
         Screen.Hosts -> HostsScreen(onBack = back)
         Screen.Tools -> ToolsScreen(onBack = back)
-        Screen.Mock -> MockScreen(onBack = back)
+        Screen.Mock -> MockScreen(
+            onBack = back,
+            onOpenRule = { nav(Screen.MockDetail(it)) }
+        )
+        is Screen.MockDetail -> {
+            val rule = MockStore.rules(context).firstOrNull { it.id == s.ruleId }
+            if (rule == null) {
+                back()
+            } else {
+                com.ht.stream.ui.MockRuleDetailScreen(rule = rule, onBack = back)
+            }
+        }
         Screen.Https -> HttpsScreen(onBack = back)
         Screen.CaptureMode -> ModeScreen(onBack = back)
         Screen.Logs -> LogsScreen(onBack = back, onOpen = { nav(Screen.LogView(it)) })

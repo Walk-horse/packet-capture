@@ -8,6 +8,7 @@ import com.ht.stream.data.HostsStore
 import com.ht.stream.data.HttpExchange
 import com.ht.stream.data.PassthroughRec
 import com.ht.stream.data.RequestStore
+import com.ht.stream.capture.UidResolver
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.ByteArrayInputStream
@@ -158,6 +159,9 @@ class LocalProxyServer {
     private fun handleForwardProxy(
         app: Socket, rawIn: InputStream, appOut: BufferedOutputStream, firstLine: String
     ) {
+        // 系统代理连接不经过 TUN，因此不能使用 DEST 前导行里的 UID。
+        // 从已接入的回环 socket 反查 WebView renderer，再归一化到宿主应用 UID。
+        val clientUid = UidResolver.uidOfLocalProxyClient(app)
         val line = firstLine.trim()
         // 正向代理请求行是 METHOD target HTTP/version；必须只取第二列。
         // 否则 GET 的 URI 解析失败，CONNECT 的端口会混入 HTTP/1.1。
@@ -193,7 +197,7 @@ class LocalProxyServer {
             readFully(rawIn, body)
             val record = byteArrayOf(first.toByte()) + headerRest + body
             val sni = SniParser.extract(record)
-            handleTls(app, record, appOut, host, port, sni, -1)
+            handleTls(app, record, appOut, host, port, sni, clientUid)
             return
         }
 
@@ -211,7 +215,7 @@ class LocalProxyServer {
                 val rebuilt = "$originLine\r\n".toByteArray() + rest
                 val stream = BufferedInputStream(
                     SequenceInputStream(ByteArrayInputStream(rebuilt), rawIn), 64 * 1024)
-                handlePlainHttp(app, stream, appOut, host, port, -1)
+                handlePlainHttp(app, stream, appOut, host, port, clientUid)
                 return
             }
         }

@@ -71,10 +71,12 @@ struct MockStatus: Decodable {
     let updatedAt: Int64?
 }
 
-/// POST /api/mock 的返回
+/// POST /api/mock 的返回（增量合并统计）
 struct MockPushResult: Decodable {
     let ok: Bool
     let count: Int?
+    let added: Int?
+    let updated: Int?
     let error: String?
 }
 
@@ -172,7 +174,7 @@ enum MockSample {
 // MARK: - 本地规则存储
 
 /// 接口模拟规则的本地存储（~/Library/Application Support/StreamDesk/mock-rules.json）。
-/// 规则在 Mac 端编辑，点「推送配置到手机」后覆盖手机端配置。
+/// 规则在 Mac 端编辑，点「推送配置到手机」后按 host + path 增量合并到手机端。
 @MainActor
 final class MockRuleStore: ObservableObject {
     @Published var rules: [MockRule] = []
@@ -259,10 +261,37 @@ final class MockRuleStore: ObservableObject {
         return r
     }
 
-    /// 替换全部规则（从手机拉取配置时用）
-    func replaceAll(_ list: [MockRule]) {
-        rules = list
+    /// 从手机拉取规则并按 host + path 增量合并：相同目标更新，不同目标追加。
+    /// 更新时保留本地 id，避免当前选中的规则因同步改变身份而跳转。
+    @discardableResult
+    func mergeFromPhone(_ list: [MockRule]) -> (added: Int, updated: Int, total: Int) {
+        var indices: [String: Int] = [:]
+        for (index, rule) in rules.enumerated() {
+            indices[endpointKey(rule)] = index
+        }
+
+        var added = 0
+        var updated = 0
+        for incoming in list {
+            let key = endpointKey(incoming)
+            if let index = indices[key] {
+                var replacement = incoming
+                replacement.id = rules[index].id
+                rules[index] = replacement
+                updated += 1
+            } else {
+                rules.append(incoming)
+                indices[key] = rules.count - 1
+                added += 1
+            }
+        }
         save()
+        return (added, updated, rules.count)
+    }
+
+    private func endpointKey(_ rule: MockRule) -> String {
+        let host = rule.host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return "\(host)\u{001F}\(rule.path)"
     }
 
     // MARK: - YAPI

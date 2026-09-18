@@ -754,7 +754,7 @@ final class SyncClient: ObservableObject {
 
     // MARK: - 接口模拟
 
-    /// 把本地规则推送到手机（整体覆盖）。
+    /// 把本地规则增量推送到手机：host + path 相同则更新，不同则追加。
     /// 手机端只有「开启总开关 + 对应应用开关」的应用才会走模拟响应。
     func pushMock(_ rules: [MockRule]) async -> String {
         guard let url = endpoint("/api/mock") else { return "请先填写手机同步地址" }
@@ -772,9 +772,12 @@ final class SyncClient: ObservableObject {
             guard let http = resp as? HTTPURLResponse else { return "推送失败：无响应" }
             let result = try? JSONDecoder().decode(MockPushResult.self, from: data)
             if http.statusCode == 200, result?.ok == true {
-                Self.logLine("mock 推送成功：\(result?.count ?? rules.count) 条规则")
+                let total = result?.count ?? rules.count
+                let added = result?.added ?? 0
+                let updated = result?.updated ?? rules.count
+                Self.logLine("mock 增量推送成功：新增 \(added)，更新 \(updated)，共 \(total) 条规则")
                 await refreshMockStatus()
-                return "已推送 \(result?.count ?? rules.count) 条规则到手机"
+                return "已增量推送：新增 \(added) 条，更新 \(updated) 条，共 \(total) 条"
             }
             let msg = result?.error ?? "HTTP \(http.statusCode)"
             Self.logLine("mock 推送失败：\(msg)")

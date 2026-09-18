@@ -33,7 +33,7 @@ import org.json.JSONTokener
  *  - GET /api/state          增量同步：仅返回尚未同步(synced=false)的请求（下发后置已同步）
  *  - GET /api/ping           探活
  *  - GET /api/mock           读取接口模拟配置（规则 + 按应用开关状态）
- *  - POST /api/mock          下发接口模拟规则（整体覆盖），body 为 {"rules":[...]} 或裸数组
+ *  - POST /api/mock          增量下发接口模拟规则（host + path 相同更新，否则追加），body 为 {"rules":[...]} 或裸数组
  *  - POST /api/mock/apps     切换总开关 / 某应用开关，body {"master":bool,"enabled":[pkg,...]}
  *  - POST /api/mock/clear    清除本机接口模拟配置（规则 + 应用开关 + 总开关）
  *  - GET /                   服务自检
@@ -213,7 +213,7 @@ object SyncServer {
                         body = mockConfigJson(ctx).toString().toByteArray(Charsets.UTF_8)
                         code = 200
                     }
-                    // 接口模拟：下发规则（整体覆盖）
+                    // 接口模拟：增量下发规则（host + path 相同则更新，否则追加）
                     path == "/api/mock" && method == "POST" -> {
                         val result = applyMockRules(ctx, reqBody)
                         body = result.toString().toByteArray(Charsets.UTF_8)
@@ -290,7 +290,7 @@ object SyncServer {
         }
     }
 
-    /** POST /api/mock：body 可为 {"rules":[...]} 或裸数组，整体覆盖规则 */
+    /** POST /api/mock：body 可为 {"rules":[...]} 或裸数组，按 host + path 增量合并 */
     private fun applyMockRules(ctx: Context?, payload: ByteArray): JSONObject {
         if (ctx == null) return JSONObject().put("ok", false).put("error", "app context 未注入")
         val text = String(payload, Charsets.UTF_8).trim()
@@ -302,10 +302,12 @@ object SyncServer {
                 else -> JSONArray()
             }
         }.getOrNull() ?: return JSONObject().put("ok", false).put("error", "JSON 解析失败")
-        val count = MockStore.setRulesJson(ctx, array.toString())
+        val merged = MockStore.mergeRulesJson(ctx, array.toString())
         return JSONObject().apply {
             put("ok", true)
-            put("count", count)
+            put("count", merged.total)
+            put("added", merged.added)
+            put("updated", merged.updated)
             put("enabled", MockStore.isEnabled(ctx))
         }
     }

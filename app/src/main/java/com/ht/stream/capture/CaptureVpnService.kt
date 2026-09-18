@@ -48,6 +48,19 @@ class CaptureVpnService : VpnService() {
         /** 抓包开始时间（epoch ms），0 表示未在抓包 */
         private val _startedAt = MutableStateFlow(0L)
         val startedAt: StateFlow<Long> = _startedAt
+
+        /** 窗口化目标 UID：仅作为该会话内 UID 解析失败时的最后兜底。 */
+        @Volatile private var windowUidHint = -1
+
+        fun setWindowUidHint(uid: Int) {
+            windowUidHint = uid.takeIf { it >= 0 } ?: -1
+        }
+
+        fun clearWindowUidHint() {
+            windowUidHint = -1
+        }
+
+        private fun fallbackWindowUid(): Int = windowUidHint
     }
 
     private var tun: ParcelFileDescriptor? = null
@@ -194,6 +207,12 @@ class CaptureVpnService : VpnService() {
                             localIp = Packet.ipKey(ip.src), localPort = tcp.srcPort,
                             remoteIp = Packet.ipKey(ip.dst), remotePort = tcp.dstPort
                         ),
+                        resolveUid = {
+                            resolveUid(
+                                localIp = Packet.ipKey(ip.src), localPort = tcp.srcPort,
+                                remoteIp = Packet.ipKey(ip.dst), remotePort = tcp.dstPort
+                            )
+                        },
                         writeToTun = { writeToTun(it) },
                         onClose = { tcpSessions.remove(it) }
                     )
@@ -224,11 +243,13 @@ class CaptureVpnService : VpnService() {
 
     /**
      * 解析连接所属 uid（见 [UidResolver]）。
-     * 实测：SYN 时刻极少查不到的连接，都是未建立即被放弃的连接（重试也查不到），
-     * 且不会产生 HTTP 记录，故不做重试，避免拖慢 TUN 读线程。
+     * TCP SYN 时先查一次；TcpSession 在首个业务数据到达时还会再次调用本方法，
+     * 以覆盖 Android 连接归属信息尚未落库的短窗口。
      */
-    private fun resolveUid(localIp: String, localPort: Int, remoteIp: String, remotePort: Int): Int =
-        UidResolver.uidOf(localIp, localPort, remoteIp, remotePort)
+    private fun resolveUid(localIp: String, localPort: Int, remoteIp: String, remotePort: Int): Int {
+        val detected = UidResolver.uidOf(localIp, localPort, remoteIp, remotePort)
+        return detected.takeIf { it >= 0 } ?: fallbackWindowUid()
+    }
 
     private fun isTunAddress(ip: ByteArray): Boolean =
         ip.size == 4 && ip[0].toInt() == 10 && ip[1].toInt() == 0 && ip[2].toInt() == 0
@@ -258,6 +279,7 @@ class CaptureVpnService : VpnService() {
         udpSessions.values.forEach { it.close() }
         tcpSessions.clear(); udpSessions.clear()
         proxyServer.stop()
+        clearWindowUidHint()
         unregisterNetworkCallback()
         try { tun?.close() } catch (_: Exception) {}
         tun = null

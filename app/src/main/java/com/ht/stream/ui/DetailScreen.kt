@@ -55,6 +55,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import com.ht.stream.data.HttpExchange
+import com.ht.stream.data.MockRule
+import com.ht.stream.data.MockStore
 import com.ht.stream.data.RequestStore
 import java.io.File
 
@@ -324,7 +326,67 @@ private fun MessageTab(e: HttpExchange, request: Boolean, searchable: Boolean = 
             contentType = if (request) e.requestContentType else e.responseContentType,
             contentEncoding = e.headerValue(headers, "Content-Encoding"),
             searchable = searchable,
-            fileName = bodyFileName
+            fileName = bodyFileName,
+            actionSlot = if (request) {
+                {
+                    Text(
+                        "cURL",
+                        fontSize = 12.sp,
+                        color = StreamColors.Blue,
+                        modifier = Modifier
+                            .clickable {
+                                clipboard.setText(AnnotatedString(buildCurl(e)))
+                                Toast.makeText(context, "cURL 已复制", Toast.LENGTH_SHORT).show()
+                            }
+                            .padding(horizontal = 4.dp)
+                    )
+                    Text(
+                        "设为模拟",
+                        fontSize = 12.sp,
+                        color = StreamColors.Blue,
+                        modifier = Modifier
+                            .clickable {
+                                val replaced = saveAsMockRule(context, e)
+                                Toast.makeText(
+                                    context,
+                                    if (replaced) "已更新接口模拟规则" else "已添加接口模拟规则",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                            .padding(horizontal = 4.dp)
+                    )
+                }
+            } else null
         )
     }
+}
+
+/** 按桌面端「从抓包生成规则」口径，把当前记录保存为手机端接口模拟规则。 */
+private fun saveAsMockRule(context: android.content.Context, e: HttpExchange): Boolean {
+    val responseType = e.responseContentType?.trim().takeUnless { it.isNullOrEmpty() }
+        ?: e.requestContentType?.trim().takeUnless { it.isNullOrEmpty() }
+        ?: "application/json"
+    val responseBody = run {
+        val encoding = e.headerValue(e.responseHeaders, "Content-Encoding")
+        val decoded = decompressBody(encoding, e.responseBody)
+        if (decoded == null || decoded.size > 256 * 1024) ""
+        else bodyToText(decoded, responseType) ?: ""
+    }
+    val rule = MockRule(
+        id = "",
+        enabled = true,
+        name = "${e.method.ifEmpty { "*" }} ${e.path.ifEmpty { "/" }}",
+        method = e.method.ifEmpty { "*" },
+        host = e.host,
+        path = e.path.substringBefore('?').ifEmpty { "/" },
+        statusCode = e.statusCode.takeIf { it in 100..599 } ?: 200,
+        contentType = responseType,
+        body = responseBody
+    )
+    val replaced = MockStore.upsertRule(context, rule)
+    MockStore.packageOfUid(context, e.uid)?.let { pkg ->
+        MockStore.setAppEnabled(context, pkg, true)
+        MockStore.setEnabled(context, true)
+    }
+    return replaced
 }

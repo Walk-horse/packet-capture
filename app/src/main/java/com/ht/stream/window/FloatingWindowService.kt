@@ -130,11 +130,18 @@ class FloatingWindowService : Service(), LifecycleOwner, SavedStateRegistryOwner
         private var active = false
         val isActive: Boolean get() = active
 
+        @Volatile
+        private var windowStartedAt = 0L
+        val targetStartedAt: Long get() = windowStartedAt
+
         private fun markActive(v: Boolean) {
             active = v
         }
 
         fun start(ctx: Context, pkg: String, uid: Int, label: String) {
+            // 窗口化选择的 UID 只在窗口会话内作为 UID 解析失败时的兜底。
+            CaptureVpnService.setWindowUidHint(uid)
+            windowStartedAt = System.currentTimeMillis()
             val i = Intent(ctx, FloatingWindowService::class.java)
                 .setAction(ACTION_START)
                 .putExtra(EXTRA_PKG, pkg)
@@ -329,6 +336,7 @@ class FloatingWindowService : Service(), LifecycleOwner, SavedStateRegistryOwner
                     CapturePanelOverlay(
                         uid = uid,
                         label = label,
+                        targetStartedAt = targetStartedAt,
                         clearedIdsState = clearedIdsState,
                         onResizeDrag = { dy -> resizePanel(dy) },
                         onClose = { removePanel() }
@@ -392,6 +400,8 @@ class FloatingWindowService : Service(), LifecycleOwner, SavedStateRegistryOwner
 
     private fun removeAll() {
         markActive(false)
+        CaptureVpnService.clearWindowUidHint()
+        windowStartedAt = 0L
         pkg = ""
         uid = -1
         label = ""
@@ -420,6 +430,7 @@ class FloatingWindowService : Service(), LifecycleOwner, SavedStateRegistryOwner
 private fun CapturePanelOverlay(
     uid: Int,
     label: String,
+    targetStartedAt: Long,
     clearedIdsState: MutableState<Set<String>>,
     onResizeDrag: (Float) -> Unit,
     onClose: () -> Unit
@@ -444,7 +455,11 @@ private fun CapturePanelOverlay(
     // 列表过滤词（host / path / method）
     var query by remember { mutableStateOf("") }
 
-    val scoped = remember(all, uid) { all.filter { it.uid == uid } }
+    // 精确 UID 优先；窗口期间仍未解析出 UID 的记录也保留，避免历史有请求但窗口面板为空。
+    // 这类记录在详情中明确标记为未解析 UID，不伪装成已确认的目标进程。
+    val scoped = remember(all, uid, targetStartedAt) {
+        all.filter { it.uid == uid || (it.uid < 0 && it.startTime >= targetStartedAt) }
+    }
     val rows = remember(scoped, clearedIds, query) {
         val q = query.trim()
         scoped.filter { it.id !in clearedIds && (q.isEmpty() ||
@@ -686,7 +701,11 @@ private fun PanelOverview(e: HttpExchange, label: String) {
                 HttpExchange.State.FAILED -> "失败：${e.error ?: "-"}"
             }
         )
-        PanelKV("所属进程", label.ifBlank { "UID ${e.uid}" })
+        PanelKV(
+            "所属进程",
+            if (e.uid >= 0) label.ifBlank { "UID ${e.uid}" }
+            else "${label.ifBlank { "目标进程" }}（UID 未解析）"
+        )
         PanelKV("远程地址", e.remoteIp ?: e.host, mono = true)
         PanelKV("上行 / 下行", "${formatSize(e.requestBody.size)} / ${formatSize(e.responseBody.size)}")
         PanelKV("总耗时", formatDuration(e.durationMs))
