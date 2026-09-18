@@ -21,6 +21,8 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Star
@@ -261,6 +263,7 @@ private fun MessageTab(e: HttpExchange, request: Boolean, searchable: Boolean = 
     }
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
+    var headersExpanded by remember(e.id, request) { mutableStateOf(false) }
 
     val bodyFileName = remember(e) {
         "${e.host.replace(Regex("[^A-Za-z0-9._-]"), "_")}_${if (request) "req" else "resp"}"
@@ -277,10 +280,38 @@ private fun MessageTab(e: HttpExchange, request: Boolean, searchable: Boolean = 
             Column {
                 Text(startLine, fontSize = 13.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
                 Spacer(Modifier.height(8.dp))
-                headers.forEach { (k, v) ->
-                    Row {
-                        Text("$k: ", fontSize = 12.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Medium)
-                        Text(v, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clickable { headersExpanded = !headersExpanded }
+                        .padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        if (request) "请求头" else "响应头",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = StreamColors.SubText,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Text(
+                        "${headers.size}",
+                        fontSize = 12.sp,
+                        color = StreamColors.SubText
+                    )
+                    Icon(
+                        if (headersExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                        contentDescription = if (headersExpanded) "收起${if (request) "请求头" else "响应头"}" else "展开${if (request) "请求头" else "响应头"}",
+                        tint = StreamColors.SubText,
+                        modifier = Modifier.padding(start = 4.dp).size(20.dp)
+                    )
+                }
+                if (headersExpanded) {
+                    headers.forEach { (k, v) ->
+                        Row {
+                            Text("$k: ", fontSize = 12.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Medium)
+                            Text(v, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                        }
                     }
                 }
             }
@@ -297,4 +328,3 @@ private fun MessageTab(e: HttpExchange, request: Boolean, searchable: Boolean = 
         )
     }
 }
-

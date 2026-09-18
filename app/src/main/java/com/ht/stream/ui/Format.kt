@@ -15,6 +15,7 @@ import java.util.zip.InflaterInputStream
 /** 资源类型分类 */
 enum class ReqType(val label: String) {
     ALL("全部"),
+    FETCH("Fetch/XHR"),
     DOC("文档"),
     IMG("图片"),
     CSSJS("css/js"),
@@ -29,14 +30,16 @@ enum class ReqType(val label: String) {
 
 /**
  * 按 Content-Type（响应优先）归类资源类型，缺失/不明确时按 path 扩展名兜底。
- * 仅保留 文档 / 图片 / css-js / wasm / 其他 五类；JSON/XML/表单等 API 响应归入「其他」。
+ * 先识别具体静态资源（图片/文档/css-js/wasm），再按 Fetch/XHR 特征识别接口调用，
+ * 其余归入「其他」。
  */
 fun classifyType(e: HttpExchange): ReqType {
     val ct = (e.responseContentType ?: e.requestContentType ?: "")
         .lowercase().substringBefore(';').trim()
     val base = e.path.substringBefore('?').lowercase()
     fun hasExt(vararg s: String) = s.any { base.endsWith(it) }
-    return when {
+    // 先识别具体静态资源：避免 image/svg+xml 等含 xml 的资源被误判为接口
+    val resourceType = when {
         ct.startsWith("image/") -> ReqType.IMG
         ct.startsWith("application/wasm") -> ReqType.WASM
         ct == "text/css" -> ReqType.CSSJS
@@ -45,9 +48,21 @@ fun classifyType(e: HttpExchange): ReqType {
         hasExt(".css", ".js", ".mjs", ".cjs") -> ReqType.CSSJS
         hasExt(".html", ".htm") -> ReqType.DOC
         hasExt(".wasm") -> ReqType.WASM
-        hasExt(".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp", ".avif", ".heic", ".webp") -> ReqType.IMG
-        else -> ReqType.OTHER
+        hasExt(".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp", ".avif", ".heic") -> ReqType.IMG
+        else -> null
     }
+    if (resourceType != null) return resourceType
+    // 静态资源之外，按 Fetch/XHR 特征识别接口调用：
+    //  - 传统 XHR 标记 X-Requested-With: XMLHttpRequest
+    //  - fetch 的 Sec-Fetch-Dest: empty（fetch/xhr 发起，非文档/资源加载）
+    //  - 响应/请求体为 JSON/XML（典型接口）
+    val isFetch = e.requestHeaders.any {
+        it.first.equals("X-Requested-With", true) && it.second.contains("XMLHttpRequest", true)
+    } || e.requestHeaders.any {
+        it.first.equals("Sec-Fetch-Dest", true) && it.second.trim().equals("empty", true)
+    } || ct.contains("json") || ct.contains("xml")
+    if (isFetch) return ReqType.FETCH
+    return ReqType.OTHER
 }
 
 fun formatSize(n: Int): String = when {

@@ -39,7 +39,7 @@ private val tutorialSections = listOf(
         "HTTPS 抓包（解密）",
         listOf(
             "1. 设置 → HTTPS 抓包 → 安装 CA 证书（系统安装或导出到下载目录手动安装）",
-            "2. Android 7+ 第三方 App 默认不信任用户证书，此类 App 会自动加密透传，不影响上网",
+            "2. Android 7+ 第三方 App 默认不信任用户证书，此类 App 会记录 TLS 握手失败，无法解密",
             "3. 要解密任意 App：需 root 后将 CA 移入系统证书目录，或目标 App 放行用户证书",
             "4. 换设备/重装 App 后需重新安装 CA；「清除 MITM 缓存」可重置证书缓存"
         )

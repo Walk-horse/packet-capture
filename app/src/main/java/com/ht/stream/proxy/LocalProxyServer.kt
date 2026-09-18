@@ -39,29 +39,9 @@ class LocalProxyServer {
             "GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "CONNECT", "TRACE"
         )
 
-        /**
-         * 握手失败过的 host → 最近失败时间戳。
-         * 冷却期内直连盲转发以免反复打断 App；冷却结束后允许重新尝试 MITM，
-         * 这样一旦目标 App 信任本 CA（或用户修正网络配置），下一次连接即可被解密捕获，
-         * 而不会像「永久黑名单」那样一次失败就永远透传、再也抓不到。
-         */
-        private val mitmFailAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
-        private const val MITM_RETRY_COOLDOWN_MS = 60_000L
-
-        /** 清除 MITM 缓存：站点证书缓存 + 失败黑名单 */
+        /** 清除动态站点证书缓存。 */
         fun clearMitmCache() {
-            mitmFailAt.clear()
             CertAuthority.clearCache()
-        }
-
-        /** 该 host 是否仍处于「近期 MITM 失败」冷却期；过期则移除并允许重试 */
-        private fun recentlyFailedMitm(host: String): Boolean {
-            val t = mitmFailAt[host] ?: return false
-            if (System.currentTimeMillis() - t > MITM_RETRY_COOLDOWN_MS) {
-                mitmFailAt.remove(host)
-                return false
-            }
-            return true
         }
     }
 
@@ -113,15 +93,27 @@ class LocalProxyServer {
         val rawIn = app.getInputStream() // 未缓冲，保证嗅探不丢字节
         val appOut = BufferedOutputStream(app.getOutputStream(), 64 * 1024)
 
-        // 1. 读取 DEST 前导行（DEST <ip> <port> [uid]）
-        val destLine = readLineRaw(rawIn) ?: return
-        if (!destLine.startsWith("DEST ")) return
-        val parts = destLine.split(" ")
-        val destIp = parts.getOrNull(1) ?: return
-        val destPort = parts.getOrNull(2)?.toIntOrNull() ?: return
-        val uid = parts.getOrNull(3)?.toIntOrNull() ?: -1
+        // 首行可能是两种来源：
+        //  - TUN 中继来的连接：以 "DEST <ip> <port> [uid]" 前导行开头
+        //  - 系统代理转发来的连接（开启「HTTPS 代理」后，WebView/H5 等走此路径）：
+        //    正向代理协议，首行为 "CONNECT host:port" 或 "GET http://... " 等
+        val firstLine = readLineRaw(rawIn) ?: return
+        if (firstLine.startsWith("DEST ")) {
+            val parts = firstLine.split(" ")
+            val destIp = parts.getOrNull(1) ?: return
+            val destPort = parts.getOrNull(2)?.toIntOrNull() ?: return
+            val uid = parts.getOrNull(3)?.toIntOrNull() ?: -1
+            dispatchTun(app, rawIn, appOut, destIp, destPort, uid)
+        } else {
+            handleForwardProxy(app, rawIn, appOut, firstLine)
+        }
+    }
 
-        // 2. 嗅探首字节分流
+    /** TUN 中继来的连接（原逻辑）：根据首字节分流 TLS / 明文 HTTP / 其他 */
+    private fun dispatchTun(
+        app: Socket, rawIn: InputStream, appOut: BufferedOutputStream,
+        destIp: String, destPort: Int, uid: Int
+    ) {
         val first = rawIn.read()
         if (first < 0) { app.close(); return }
 
@@ -155,6 +147,126 @@ class LocalProxyServer {
                 blindRelay(app, stream, appOut, destIp, destPort)
             }
         }
+    }
+
+    /**
+     * 处理「系统代理」转发来的正向代理连接（开启「HTTPS 代理」后，WebView/H5 等走此路径）。
+     *  - CONNECT host:port → 回 200 Connection Established，然后对隧道内 TLS 做 MITM（可抓 H5）
+     *  - GET http://...    → 改写请求行为 origin-form 后当明文 HTTP 转发
+     *  - 其它（含 https:// 绝对 URI 等）→ 作为 TCP 隧道盲转，保证 App 不报错断网
+     */
+    private fun handleForwardProxy(
+        app: Socket, rawIn: InputStream, appOut: BufferedOutputStream, firstLine: String
+    ) {
+        val line = firstLine.trim()
+        // 正向代理请求行是 METHOD target HTTP/version；必须只取第二列。
+        // 否则 GET 的 URI 解析失败，CONNECT 的端口会混入 HTTP/1.1。
+        val requestParts = line.split(Regex("\\s+"), limit = 3)
+        val method = requestParts.getOrNull(0)?.uppercase() ?: return
+        val target = requestParts.getOrNull(1) ?: return
+
+        if (method == "CONNECT") {
+            val authority = parseAuthority(target, 443) ?: return
+            val host = authority.first
+            val port = authority.second
+            // 丢弃 CONNECT 请求行之后的请求头（Proxy-Connection 等），否则其字节会污染隧道内的 ClientHello
+            readHeadBlock(rawIn)
+            // 回 200 建立隧道（参考 ProxyPin http_proxy_handle.dart）
+            appOut.write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray())
+            appOut.flush()
+            FileLogger.log("PROXY CONNECT $host:$port")
+            // 读隧道内的 ClientHello（与 TUN 路径一致）
+            val first = rawIn.read()
+            if (first < 0) { runCatching { app.close() }; return }
+            if (first != 0x16) {
+                val stream = BufferedInputStream(
+                    SequenceInputStream(ByteArrayInputStream(byteArrayOf(first.toByte())), rawIn), 64 * 1024)
+                blindRelay(app, stream, appOut, host, port,
+                    tls = false, hostLabel = host, reason = "CONNECT 隧道非 TLS 流量")
+                return
+            }
+            val headerRest = ByteArray(4)
+            readFully(rawIn, headerRest)
+            val recordLen = ((headerRest[2].toInt() and 0xFF) shl 8) or (headerRest[3].toInt() and 0xFF)
+            if (recordLen <= 0 || recordLen > 18432) { runCatching { app.close() }; return }
+            val body = ByteArray(recordLen)
+            readFully(rawIn, body)
+            val record = byteArrayOf(first.toByte()) + headerRest + body
+            val sni = SniParser.extract(record)
+            handleTls(app, record, appOut, host, port, sni, -1)
+            return
+        }
+
+        // 明文 HTTP 正向代理（GET http://...）：改写请求行为 origin-form 后转发
+        if (target.startsWith("http://", ignoreCase = true)) {
+            val uri = runCatching { java.net.URI(target) }.getOrNull()
+            if (uri?.host != null) {
+                val host = uri.host
+                val port = if (uri.port > 0) uri.port else 80
+                val path = (uri.path ?: "") + if (uri.query != null) "?${uri.query}" else ""
+                val originLine = "$method ${if (path.isEmpty()) "/" else path} HTTP/1.1"
+                val headBlock = readHeadBlock(rawIn)
+                val cut = String(headBlock, Charsets.ISO_8859_1).indexOf("\r\n")
+                val rest = if (cut >= 0) headBlock.copyOfRange(cut + 2, headBlock.size) else headBlock
+                val rebuilt = "$originLine\r\n".toByteArray() + rest
+                val stream = BufferedInputStream(
+                    SequenceInputStream(ByteArrayInputStream(rebuilt), rawIn), 64 * 1024)
+                handlePlainHttp(app, stream, appOut, host, port, -1)
+                return
+            }
+        }
+
+        // 其它（含 https:// 绝对 URI 等少见情形）：作为 TCP 隧道盲转，保活不报错
+        val hp = parseHostPortFromTarget(target)
+        if (hp != null) {
+            FileLogger.log("PROXY tunnel $method -> ${hp.first}:${hp.second}")
+            val stream = BufferedInputStream(
+                SequenceInputStream(ByteArrayInputStream("$firstLine\r\n".toByteArray()), rawIn), 64 * 1024)
+            blindRelay(app, stream, appOut, hp.first, hp.second, reason = "正向代理隧道透传: $method")
+        } else {
+            runCatching { app.close() }
+        }
+    }
+
+    /** 从绝对 URI（http://host:port/ 或 https://host:port/）中解析 host:port */
+    private fun parseHostPortFromTarget(target: String): Pair<String, Int>? {
+        val m = Regex("""^[a-zA-Z]+://([^/:?#]+)(?::(\d+))?""").find(target) ?: return null
+        val host = m.groupValues[1]
+        val port = m.groupValues[2].toIntOrNull() ?: if (target.startsWith("https", true)) 443 else 80
+        return host to port
+    }
+
+    /** 解析 CONNECT authority，兼容 host:port 与 [IPv6]:port。 */
+    private fun parseAuthority(target: String, defaultPort: Int): Pair<String, Int>? {
+        val value = target.trim()
+        if (value.startsWith("[")) {
+            val end = value.indexOf(']')
+            if (end <= 1) return null
+            val host = value.substring(1, end)
+            val port = value.substring(end + 1).removePrefix(":").toIntOrNull() ?: defaultPort
+            return host to port
+        }
+        val colon = value.lastIndexOf(':')
+        if (colon <= 0) return value to defaultPort
+        return value.substring(0, colon) to (value.substring(colon + 1).toIntOrNull() ?: defaultPort)
+    }
+
+    /** 读取 HTTP 头块（到 \r\n\r\n 为止，含结尾 CRLF），用于改写正向代理请求行 */
+    private fun readHeadBlock(input: InputStream): ByteArray {
+        val out = ByteArrayOutputStream()
+        val tail = ByteArray(4)
+        var n = 0
+        while (true) {
+            val c = input.read()
+            if (c < 0) break
+            out.write(c)
+            if (n < 4) tail[n] = c.toByte()
+            else { tail[0] = tail[1]; tail[1] = tail[2]; tail[2] = tail[3]; tail[3] = c.toByte() }
+            n++
+            if (n >= 4 && tail[0] == '\r'.code.toByte() && tail[1] == '\n'.code.toByte()
+                && tail[2] == '\r'.code.toByte() && tail[3] == '\n'.code.toByte()) break
+        }
+        return out.toByteArray()
     }
 
     // ---------- 明文 HTTP ----------
@@ -230,13 +342,6 @@ class LocalProxyServer {
         destIp: String, destPort: Int, sni: String?, uid: Int
     ) {
         val host = sni ?: destIp
-        // 该 host 近期 MITM 失败过 → 冷却期内透传，保证 App 可用；过期后下方会重试
-        if (recentlyFailedMitm(host)) {
-            val stream = BufferedInputStream(SequenceInputStream(ByteArrayInputStream(clientHello), app.getInputStream()), 64 * 1024)
-            blindRelay(app, stream, appOut, destIp, destPort,
-                tls = true, hostLabel = sni, reason = "App 不信任 CA，自动透传")
-            return
-        }
         // 抓包模式（黑/白名单）：不命中的 host 透传不解析。
         // 例外：该 host 配了接口模拟规则时必须解密，否则看不到请求就无法模拟。
         if (!CaptureMode.shouldMitm(appContext, host) && !MockEngine.shouldForceMitm(appContext, host)) {
@@ -249,13 +354,14 @@ class LocalProxyServer {
         val serverCtx = try {
             CertAuthority.serverContext(appContext, host)
         } catch (e: Exception) {
-            Log.w(TAG, "no cert for $host: ${e.message}")
+            Log.w(TAG, "no MITM certificate for host=$host sni=$sni", e)
+            FileLogger.log("TLS $host 站点证书生成失败，连接已关闭: ${e.javaClass.simpleName}: ${e.message ?: "无错误信息"}")
             null
         }
         if (serverCtx == null) {
-            val stream = BufferedInputStream(SequenceInputStream(ByteArrayInputStream(clientHello), app.getInputStream()), 64 * 1024)
-            blindRelay(app, stream, appOut, destIp, destPort,
-                tls = true, hostLabel = sni, reason = "站点证书生成失败，自动透传")
+            // TLS 已被识别为需要 MITM；证书上下文失败时不能伪装成普通透传。
+            // 否则 UI 只显示“透传”，实际的 CA/证书生成错误会被隐藏。
+            runCatching { app.close() }
             return
         }
 
@@ -264,15 +370,37 @@ class LocalProxyServer {
             val replay = ReplaySocket(app, clientHello)
             val s = serverCtx.socketFactory.createSocket(replay, host, destPort, true) as SSLSocket
             s.useClientMode = false
+            // 代理层当前按 HTTP/1.1 解析，明确选择该协议，避免 WebView 看到未协商
+            // ALPN 后继续按 HTTP/2 发送二进制帧，最终表现为 SSL protocol error。
+            s.sslParameters = s.sslParameters.apply {
+                applicationProtocols = arrayOf("http/1.1")
+            }
+            s.wantClientAuth = false
+            s.needClientAuth = false
             s.soTimeout = 30_000
             s.startHandshake()
             s
         } catch (e: Exception) {
-            // 多半是 App 不信任我们的 CA（Android 7+ 默认不信任用户证书）。
-            // 记录失败时间进入冷却期：冷却内透传不打断 App；冷却结束后会自动重试 MITM，
-            // 若此时已正确安装/信任本 CA 即可正常解密（不再「一次失败永远透传」）。
-            Log.d(TAG, "TLS handshake with app failed ($host): ${e.message}")
-            mitmFailAt[host] = System.currentTimeMillis()
+            // 这里不能回退为透传：SSLSocket 可能已经向 App 发出了 ServerHello/证书，
+            // 此时再把同一个 ClientHello 发送给真实服务器会把两套 TLS 会话拼到一起，
+            // WebView 会报 ERR_SSL_PROTOCOL_ERROR / "Failure in SSL library"。
+            // 直接关闭连接，保留真实握手异常，便于区分 unknown_ca、SSL pinning 和协议问题。
+            val detail = buildString {
+                append(e.javaClass.simpleName)
+                append(": ")
+                append(e.message ?: "无错误信息")
+                var cause = e.cause
+                var depth = 0
+                while (cause != null && depth++ < 3) {
+                    append("; cause=")
+                    append(cause.javaClass.simpleName)
+                    append(": ")
+                    append(cause.message ?: "")
+                    cause = cause.cause
+                }
+            }
+            Log.w(TAG, "TLS MITM handshake failed host=$host sni=$sni: $detail", e)
+            FileLogger.log("TLS $host MITM 失败，连接已关闭: $detail")
             runCatching { app.close() }
             return
         }

@@ -13,6 +13,8 @@ object CaptureMode {
     private const val KEY_BLACK_ON = "black_on"
     private const val KEY_WHITE_ON = "white_on"
     private const val KEY_QUIC_BLOCK = "quic_block"
+    private const val KEY_HTTPS_PROXY = "https_proxy"
+    private const val KEY_HTTPS_PROXY_INITIALIZED = "https_proxy_initialized"
     private const val KEY_BLACK = "black_list"
     private const val KEY_WHITE = "white_list"
 
@@ -26,6 +28,29 @@ object CaptureMode {
      *  默认开启：否则 HTTP/3 接口会直接走 UDP 透传、永远抓不到（与代理类工具行为一致）。 */
     fun quicBlockOn(context: Context): Boolean = prefs(context).getBoolean(KEY_QUIC_BLOCK, true)
 
+    /**
+     * 启用「HTTPS 代理」（系统级 HTTP 代理，参考 ProxyPin）。
+     * 开启后会在 VPN 接口上把整机 HTTP/HTTPS 系统代理指向本机 127.0.0.1:8888，
+     * 从而能抓取 WebView / H5 等「不吃系统代理就直连 + 抢 QUIC」的流量。
+     * 默认开启：与 ProxyPin 的 setSystemProxy=true 保持一致；用户仍可手动关闭。
+     *
+     * 注意：该开关在 VpnService 建立时读取，需在「开启抓包」时生效（与 ProxyPin 一致）。
+     * 开启后会将系统代理连接送入本地 MITM；不信任本 CA 的 App 会在握手失败时断开，
+     * 不会把已经开始的 TLS 会话错误地切换成透传。
+     */
+    fun httpsProxyOn(context: Context): Boolean {
+        val p = prefs(context)
+        // 早期版本曾以 false 写入该 key。首次运行新逻辑时迁移为 ProxyPin 的默认值 true，
+        // 之后用户通过设置页主动关闭则保留 false。
+        if (!p.getBoolean(KEY_HTTPS_PROXY_INITIALIZED, false)) {
+            p.edit()
+                .putBoolean(KEY_HTTPS_PROXY, true)
+                .putBoolean(KEY_HTTPS_PROXY_INITIALIZED, true)
+                .apply()
+        }
+        return p.getBoolean(KEY_HTTPS_PROXY, true)
+    }
+
     fun setBlacklistOn(context: Context, on: Boolean) =
         prefs(context).edit().putBoolean(KEY_BLACK_ON, on).apply()
 
@@ -34,6 +59,12 @@ object CaptureMode {
 
     fun setQuicBlockOn(context: Context, on: Boolean) =
         prefs(context).edit().putBoolean(KEY_QUIC_BLOCK, on).apply()
+
+    fun setHttpsProxyOn(context: Context, on: Boolean) =
+        prefs(context).edit()
+            .putBoolean(KEY_HTTPS_PROXY, on)
+            .putBoolean(KEY_HTTPS_PROXY_INITIALIZED, true)
+            .apply()
 
     fun blacklist(context: Context): List<String> = load(context, KEY_BLACK)
     fun whitelist(context: Context): List<String> = load(context, KEY_WHITE)

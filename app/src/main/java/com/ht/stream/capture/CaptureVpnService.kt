@@ -6,6 +6,9 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.ProxyInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -60,6 +63,9 @@ class CaptureVpnService : VpnService() {
     private val proxyServer = LocalProxyServer()
     private val cleaner = Executors.newSingleThreadScheduledExecutor()
     @Volatile private var packetCount = 0L
+    private var connectivityManager: ConnectivityManager? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    @Volatile private var activeNetwork: Network? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -97,6 +103,21 @@ class CaptureVpnService : VpnService() {
             .apply {
                 // 本 App 自身流量不经过 VPN，避免代理出站被环回
                 try { addDisallowedApplication(packageName) } catch (_: Exception) {}
+                // 「HTTPS 代理」开关（参考 ProxyPin）：在 VPN 接口上把整机 HTTP/HTTPS 系统代理
+                // 指向本机代理端口，使 WebView/H5 等不走系统代理就会直连+抢 QUIC 的流量也能被 MITM。
+                // 与 ProxyPin 的 setSystemProxy=true 对齐：默认把 VPN 内 HTTP/HTTPS
+                // 请求送到本机正向代理，WebView/H5 才会进入 CONNECT/TLS MITM 路径。
+                // 仅 Android Q+ 支持 setHttpProxy；低版本仍使用透明 TUN 路径。
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+                    CaptureMode.httpsProxyOn(applicationContext)
+                ) {
+                    try {
+                        setHttpProxy(ProxyInfo.buildDirectProxy("127.0.0.1", proxyServer.port))
+                        Log.i(TAG, "system http proxy set -> 127.0.0.1:${proxyServer.port}")
+                    } catch (e: Exception) {
+                        Log.w(TAG, "setHttpProxy failed: ${e.message}")
+                    }
+                }
             }
             .establish()
 
@@ -107,6 +128,7 @@ class CaptureVpnService : VpnService() {
         }
         tun = fd
         tunOutput = FileOutputStream(fd.fileDescriptor)
+        bindUnderlyingNetwork()
         active = true
         _running.value = true
         _startedAt.value = System.currentTimeMillis()
@@ -236,6 +258,7 @@ class CaptureVpnService : VpnService() {
         udpSessions.values.forEach { it.close() }
         tcpSessions.clear(); udpSessions.clear()
         proxyServer.stop()
+        unregisterNetworkCallback()
         try { tun?.close() } catch (_: Exception) {}
         tun = null
         tunOutput = null
@@ -245,6 +268,40 @@ class CaptureVpnService : VpnService() {
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
         Log.i(TAG, "capture stopped")
+    }
+
+    /** 与 ProxyPin 一样把 VPN 绑定到当前默认网络，避免切网后仍使用旧底层网络。 */
+    private fun bindUnderlyingNetwork() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return
+        val cm = getSystemService(CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+        connectivityManager = cm
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                activeNetwork = network
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
+                    runCatching { setUnderlyingNetworks(arrayOf(network)) }
+                        .onFailure { Log.w(TAG, "setUnderlyingNetworks failed: ${it.message}") }
+                }
+            }
+        }
+        networkCallback = callback
+        try {
+            cm.registerDefaultNetworkCallback(callback)
+        } catch (e: Exception) {
+            Log.w(TAG, "register default network callback failed: ${e.message}")
+            networkCallback = null
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        val cm = connectivityManager
+        val callback = networkCallback
+        if (cm != null && callback != null) {
+            runCatching { cm.unregisterNetworkCallback(callback) }
+        }
+        networkCallback = null
+        connectivityManager = null
+        activeNetwork = null
     }
 
     private fun startForegroundInternal() {

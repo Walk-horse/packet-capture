@@ -187,6 +187,13 @@ object CertAuthority {
         )
         val extUtils = JcaX509ExtensionUtils()
         builder.addExtension(Extension.basicConstraints, true, BasicConstraints(false))
+        // 明确声明该动态站点证书可用于 TLS 服务端签名/密钥交换，兼容 Android WebView
+        // 对服务端证书用途的严格校验。
+        builder.addExtension(
+            Extension.keyUsage,
+            true,
+            KeyUsage(KeyUsage.digitalSignature or KeyUsage.keyEncipherment)
+        )
         builder.addExtension(Extension.subjectKeyIdentifier, false, extUtils.createSubjectKeyIdentifier(kp.public))
         builder.addExtension(Extension.authorityKeyIdentifier, false, extUtils.createAuthorityKeyIdentifier(issuer))
         builder.addExtension(

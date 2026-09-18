@@ -769,21 +769,30 @@ fun CaptureScreen(
     var sub by remember { mutableStateOf<Sub?>(null) }
     var showEndDialog by remember { mutableStateOf(false) }
     // 进入抓包页即视为新抓包会话：隐藏进入前已有的记录，列表初始为空
-    var clearedIds by remember { mutableStateOf(RequestStore.exchanges.value.map { it.id }.toSet()) }
     val listState = rememberLazyListState()
     LaunchedEffect(tab, typeSel, sub) { listState.scrollToItem(0) }
+    // 进入抓包页时隐藏历史快照：提升到单例，避免导航到详情再返回导致重组重置、列表被清空
+    CaptureUiState.ensureSnapshot()
     val ctx = LocalContext.current
     val appInfo = remember(ctx) { AppInfoResolver(ctx.applicationContext) }
     val onOpen: (HttpExchange) -> Unit = { nav(Screen.Detail(it.id)) }
 
     val handleBack: () -> Unit = {
-        if (running) showEndDialog = true else onBack()
+        // 处于二级明细页（按域名/透传）时，返回到对应列表页，而不是直接回到总览（与「全部请求」页一致）
+        if (sub != null) {
+            sub = null
+        } else if (running) {
+            showEndDialog = true
+        } else {
+            onBack()
+        }
     }
     BackHandler(enabled = true) { handleBack() }
 
     val base = all
     // 当前会话可见记录（进入页面时之前的历史被隐藏）
-    val visible = remember(base, clearedIds) { base.filter { it.id !in clearedIds } }
+    val cleared = CaptureUiState.clearedIds.value
+    val visible = remember(base, cleared) { base.filter { it.id !in cleared } }
     // 过滤条件仅作用于「全部请求」tab
     val filtered = remember(visible, filter, typeSel) {
         visible.filter { e ->
@@ -811,7 +820,7 @@ fun CaptureScreen(
             onBack = handleBack,
             backLabel = "总览",
             actions = {
-                IconButton(onClick = { clearedIds = all.map { it.id }.toSet() }) {
+                IconButton(onClick = { CaptureUiState.clearedIds.value = all.map { it.id }.toSet() }) {
                     Icon(Icons.Filled.Delete, contentDescription = "清除", tint = Color.White)
                 }
             }
@@ -976,7 +985,7 @@ fun CaptureScreen(
                         0 -> {
                             // 全部请求：平铺（应用过滤条件）
                             if (filtered.isEmpty()) {
-                                item { EmptyHint(captureEmptyText(all, clearedIds)) }
+                                item { EmptyHint(captureEmptyText(all, CaptureUiState.clearedIds.value)) }
                             } else {
                                 items(filtered, key = { it.id }) { e ->
                                     ExchangeRow(e) { onOpen(e) }
@@ -986,7 +995,7 @@ fun CaptureScreen(
                         1 -> {
                             // 按域名：域名聚合 → 二级为请求明细（不受过滤条件影响）
                             if (visible.isEmpty()) {
-                                item { EmptyHint(captureEmptyText(all, clearedIds)) }
+                                item { EmptyHint(captureEmptyText(all, CaptureUiState.clearedIds.value)) }
                             } else {
                                 val hosts = visible.groupBy { it.host }.toList()
                                     .sortedByDescending { it.second.size }
@@ -1067,4 +1076,24 @@ private fun formatCaptureElapsed(ms: Long): String {
 private fun captureEmptyText(all: List<HttpExchange>, clearedIds: Set<String>): String {
     val hasHiddenHistory = all.any { it.id in clearedIds }
     return if (hasHiddenHistory) "抓包历史已保留，本次新记录将显示在此" else "暂无请求"
+}
+
+/**
+ * 抓包页跨组合持久的 UI 状态。
+ * 根因：MainActivity 用栈式 Screen 导航，进入详情页时 CaptureScreen 会被移出组合树，
+ * 返回时重新组合，页面级 remember 全部重置。原 clearedIds 用 remember 保存，
+ * 重置后变成「当前全部记录 id」，导致 visible 过滤后列表清空。
+ * 故把 clearedIds 提升到此处单例，仅首次进入抓包页时拍一次快照，后续返回不再重置。
+ */
+private object CaptureUiState {
+    val clearedIds = mutableStateOf<Set<String>>(emptySet())
+    private var snapshotTaken = false
+
+    /** 进入抓包页时调用一次：把当时已有记录标记为「历史」隐藏，仅展示之后新抓到的 */
+    fun ensureSnapshot() {
+        if (!snapshotTaken) {
+            clearedIds.value = RequestStore.exchanges.value.map { it.id }.toSet()
+            snapshotTaken = true
+        }
+    }
 }
