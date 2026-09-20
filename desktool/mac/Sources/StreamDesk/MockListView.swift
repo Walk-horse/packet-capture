@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// 接口模拟：规则列表（左中栏）。
-/// 规则在 Mac 端编辑，点「推送配置到手机」覆盖手机端配置；
+/// 规则在 Mac 端编辑，点「推送配置到手机」按 host + path 增量合并到手机端；
 /// 手机端还需「开启总开关 + 为对应应用打开开关」才会返回模拟响应。
 struct MockListView: View {
     @EnvironmentObject var client: SyncClient
@@ -78,7 +78,7 @@ struct MockListView: View {
                 }
                 .controlSize(.small)
                 .disabled(pushing)
-                .help("把全部规则整体覆盖到手机端")
+                .help("按 host + path 增量更新手机端规则，不同接口追加")
 
                 Button {
                     Task { await pullFromPhone() }
@@ -88,7 +88,7 @@ struct MockListView: View {
                 }
                 .controlSize(.small)
                 .disabled(pulling)
-                .help("用手机端当前配置覆盖本地规则")
+                .help("按 host + path 合并手机端规则，相同接口更新，不同接口追加")
             }
 
             HStack(spacing: 6) {
@@ -181,8 +181,8 @@ struct MockListView: View {
             return
         }
         if let rules = cfg.rules {
-            store.replaceAll(rules)
-            showToast("已从手机拉取 \(rules.count) 条规则")
+            let result = store.mergeFromPhone(rules)
+            showToast("已增量拉取：新增 \(result.added) 条，更新 \(result.updated) 条，共 \(result.total) 条")
         } else {
             showToast("手机端无规则数据")
         }

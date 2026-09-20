@@ -30,7 +30,8 @@ object SyncJson {
      * @param full true=全量（返回全部并置已同步）；false=增量（仅未同步部分并置已同步）
      */
     fun state(full: Boolean): JSONObject {
-        val sendEx = RequestStore.takeExchangesForSync(full)
+        // 增量（full=false）按批上限取，避免单条 JSON 过大 OOM；全量保持完整（桌面端整体替换语义）
+        val sendEx = RequestStore.takeExchangesForSync(full, if (full) Int.MAX_VALUE else 200)
         val obj = JSONObject()
         obj.put("capturing", CaptureVpnService.running.value)
         obj.put("uploadBytes", RequestStore.uploadBytes.get())
@@ -68,6 +69,22 @@ object SyncJson {
         obj.put("startedAt", CaptureVpnService.startedAt.value)
         obj.put("exchanges", JSONArray().apply { send.forEach { put(exchange(it)) } })
         obj.put("passthrough", passthroughs())
+        return obj
+    }
+
+    /** WS 状态变更推送：抓包开始 / 停止时立即下发，让桌面端实时刷新「正在抓包」指示，
+     *  不依赖桌面端轮询（autoSync 关闭时也能即时更新）。不含请求列表，仅带最新统计。 */
+    fun wsStatus(): JSONObject {
+        val obj = JSONObject()
+        obj.put("type", "status")
+        obj.put("capturing", CaptureVpnService.running.value)
+        obj.put("uploadBytes", RequestStore.uploadBytes.get())
+        obj.put("downloadBytes", RequestStore.downloadBytes.get())
+        obj.put("requestCount", RequestStore.exchanges.value.size)
+        obj.put("passthroughCount", RequestStore.passthrough.value.size)
+        obj.put("startedAt", CaptureVpnService.startedAt.value)
+        obj.put("exchanges", JSONArray())
+        obj.put("passthrough", JSONArray())
         return obj
     }
 

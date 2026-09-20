@@ -19,6 +19,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import org.json.JSONArray
@@ -32,13 +33,14 @@ import org.json.JSONTokener
  *  - GET /api/state          增量同步：仅返回尚未同步(synced=false)的请求（下发后置已同步）
  *  - GET /api/ping           探活
  *  - GET /api/mock           读取接口模拟配置（规则 + 按应用开关状态）
- *  - POST /api/mock          下发接口模拟规则（整体覆盖），body 为 {"rules":[...]} 或裸数组
+ *  - POST /api/mock          增量下发接口模拟规则（host + path 相同更新，否则追加），body 为 {"rules":[...]} 或裸数组
  *  - POST /api/mock/apps     切换总开关 / 某应用开关，body {"master":bool,"enabled":[pkg,...]}
  *  - POST /api/mock/clear    清除本机接口模拟配置（规则 + 应用开关 + 总开关）
  *  - GET /                   服务自检
  *  - GET /api/ws  (Upgrade: websocket)       移动端主动推送：连接时下发未同步快照，之后数据变化即时增量推送
  *
- * 抓包开启时本机外发流量走 TUN，但服务接收的是局域网/USB 入站连接，不受 VPN 影响。
+ * 抓包开启时本机外发流量走 TUN；同步服务仅监听 127.0.0.1（loopback），流量经 adb forward 入站，
+ * 不受 VPN 影响、也不暴露到局域网（消除同 WiFi 未授权访问风险）。
  */
 object SyncServer {
 
@@ -66,13 +68,18 @@ object SyncServer {
 
     val isRunning: Boolean get() = runningFlag.get()
 
-    /** 实际对外地址，UI 展示给用户在 Mac 端填写 */
-    val address: String get() = "${localIpv4() ?: "手机IP"}:$port"
+    /** 实际对外地址：仅 loopback（同步流量走 adb forward），UI 展示给用户经 USB 连接时填写 */
+    val address: String get() = "127.0.0.1:$port"
 
     // ---------- WebSocket 推送 ----------
     private val wsScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     @Volatile private var broadcastJob: Job? = null
+    @Volatile private var pingJob: Job? = null
     private val wsClients = Collections.synchronizedList(mutableListOf<WsClient>())
+
+    /** WS 并发上限：防止重连风暴 / 多开面板在手机端无限制新建阻塞读线程与 FD，
+     *  进而推高 adbd 侧 forward 子通道数、累积资源拖垮 adbd。 */
+    private const val MAX_WS_CLIENTS = 5
 
     @Synchronized
     fun start(preferred: Int = DEFAULT_PORT): Boolean {
@@ -84,7 +91,8 @@ object SyncServer {
             try {
                 val s = ServerSocket()
                 s.reuseAddress = true
-                s.bind(InetSocketAddress(p))
+                // 仅绑定 loopback：同步流量一律经 adb forward 入站，彻底消除「同 WiFi 任意设备可读全部明文流量」的未授权访问漏洞
+                s.bind(InetSocketAddress("127.0.0.1", p))
                 ss = s
                 usedPort = p
                 break
@@ -114,6 +122,26 @@ object SyncServer {
                 }
             }
         }
+        // 心跳探测：WS 连接设了 soTimeout=0（允许空闲），但静默掉线（合盖/切 WiFi 未发 FIN）
+        // 会让服务端 read 线程永久阻塞、占住线程与 FD；定期发 ping，发送失败即判定对端已死并回收。
+        if (pingJob == null) {
+            pingJob = wsScope.launch {
+                try {
+                    while (true) {
+                        delay(30_000)
+                        val snapshot = synchronized(wsClients) { wsClients.toList() }
+                        for (client in snapshot) {
+                            if (!client.alive) continue
+                            // 发送空 ping；对端已死时底层 write 抛异常 → alive=false
+                            client.send(wsFrame(ByteArray(0), 0x9))
+                            if (!client.alive) client.close() // 关闭 socket 使阻塞的 read 线程退出
+                        }
+                    }
+                } catch (_: Exception) {
+                    // scope 取消时结束
+                }
+            }
+        }
         return true
     }
 
@@ -122,6 +150,8 @@ object SyncServer {
         runningFlag.set(false)
         broadcastJob?.cancel()
         broadcastJob = null
+        pingJob?.cancel()
+        pingJob = null
         synchronized(wsClients) {
             wsClients.forEach { it.close() }
             wsClients.clear()
@@ -183,7 +213,7 @@ object SyncServer {
                         body = mockConfigJson(ctx).toString().toByteArray(Charsets.UTF_8)
                         code = 200
                     }
-                    // 接口模拟：下发规则（整体覆盖）
+                    // 接口模拟：增量下发规则（host + path 相同则更新，否则追加）
                     path == "/api/mock" && method == "POST" -> {
                         val result = applyMockRules(ctx, reqBody)
                         body = result.toString().toByteArray(Charsets.UTF_8)
@@ -260,7 +290,7 @@ object SyncServer {
         }
     }
 
-    /** POST /api/mock：body 可为 {"rules":[...]} 或裸数组，整体覆盖规则 */
+    /** POST /api/mock：body 可为 {"rules":[...]} 或裸数组，按 host + path 增量合并 */
     private fun applyMockRules(ctx: Context?, payload: ByteArray): JSONObject {
         if (ctx == null) return JSONObject().put("ok", false).put("error", "app context 未注入")
         val text = String(payload, Charsets.UTF_8).trim()
@@ -272,10 +302,12 @@ object SyncServer {
                 else -> JSONArray()
             }
         }.getOrNull() ?: return JSONObject().put("ok", false).put("error", "JSON 解析失败")
-        val count = MockStore.setRulesJson(ctx, array.toString())
+        val merged = MockStore.mergeRulesJson(ctx, array.toString())
         return JSONObject().apply {
             put("ok", true)
-            put("count", count)
+            put("count", merged.total)
+            put("added", merged.added)
+            put("updated", merged.updated)
             put("enabled", MockStore.isEnabled(ctx))
         }
     }
@@ -352,7 +384,8 @@ object SyncServer {
     // ================= WebSocket =================
 
     private fun handleWs(sock: Socket, key: String) {
-        sock.soTimeout = 0 // 推送通道允许空闲，不设读超时（断连由对方 FIN 触发）
+        sock.soTimeout = 0 // 推送通道允许空闲，不设读超时（断连由对方 FIN / 心跳 ping 触发）
+        runCatching { sock.keepAlive = true } // 兜底：TCP 层探测死连接
         val accept = computeAcceptKey(key)
         val handshake = buildString {
             append("HTTP/1.1 101 Switching Protocols\r\n")
@@ -363,6 +396,12 @@ object SyncServer {
         val out = sock.getOutputStream()
         out.write(handshake.toByteArray(Charsets.UTF_8))
         out.flush()
+
+        // 并发上限检查：超限直接关闭，避免僵尸线程/FD 累积拖垮手机端乃至 adbd
+        if (synchronized(wsClients) { wsClients.count { it.alive } } >= MAX_WS_CLIENTS) {
+            runCatching { sock.close() }
+            return
+        }
 
         val client = WsClient(sock, out)
         // 下发增量快照（仅尚未同步的「已落定」记录，并置已同步）
@@ -398,9 +437,22 @@ object SyncServer {
         // HTTP 增量轮询从此永远拉不到新数据（表现为桌面端清屏后不再同步）。
         if (wsClients.none { it.alive }) return
         // 与 HTTP 增量共用 synced 标志位：取 settled && !synced 并置位，桌面端按 id 去重
+        // takeExchangesForSync 默认按批上限（200）取，未同步过多时自动分批并触发后续广播，避免单条 JSON 过大 OOM
         val send = RequestStore.takeExchangesForSync(false)
         if (send.isEmpty()) return
         val json = runCatching { SyncJson.wsDelta(send).toString() }.getOrNull() ?: return
+        val snapshot = synchronized(wsClients) { wsClients.toList() }
+        for (client in snapshot) {
+            if (client.alive) client.send(json)
+        }
+    }
+
+    /** 抓包状态变更（开始 / 停止）立即广播：桌面端 WS 收到后即时刷新「正在抓包」指示，
+     *  不依赖桌面端轮询（autoSync 关闭也不受影响）。
+     *  无存活 WS 客户端时直接返回：本推送只发状态、不取请求数据，因此即便返回也不影响 synced 标志位。 */
+    fun broadcastStatus() {
+        if (wsClients.none { it.alive }) return
+        val json = runCatching { SyncJson.wsStatus().toString() }.getOrNull() ?: return
         val snapshot = synchronized(wsClients) { wsClients.toList() }
         for (client in snapshot) {
             if (client.alive) client.send(json)

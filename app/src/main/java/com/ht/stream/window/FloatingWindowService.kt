@@ -60,6 +60,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -129,11 +130,18 @@ class FloatingWindowService : Service(), LifecycleOwner, SavedStateRegistryOwner
         private var active = false
         val isActive: Boolean get() = active
 
+        @Volatile
+        private var windowStartedAt = 0L
+        val targetStartedAt: Long get() = windowStartedAt
+
         private fun markActive(v: Boolean) {
             active = v
         }
 
         fun start(ctx: Context, pkg: String, uid: Int, label: String) {
+            // 窗口化选择的 UID 只在窗口会话内作为 UID 解析失败时的兜底。
+            CaptureVpnService.setWindowUidHint(uid)
+            windowStartedAt = System.currentTimeMillis()
             val i = Intent(ctx, FloatingWindowService::class.java)
                 .setAction(ACTION_START)
                 .putExtra(EXTRA_PKG, pkg)
@@ -163,6 +171,14 @@ class FloatingWindowService : Service(), LifecycleOwner, SavedStateRegistryOwner
 
     /** 面板当前高度（px）。可通过顶部把手上下拖拽调整，范围 25% ~ 80% 屏高 */
     private var panelHeightPx = 0
+
+    /**
+     * 窗口化会话内的清屏记录 id。
+     * 提升为服务级字段：面板 ComposeView 在关闭/重开时会被整体销毁重建，
+     * 若用 Composable 内的 [remember] 持有清屏状态，重建后会丢失 → 表现为「关闭再打开清屏数据又出现」。
+     * 放这里可跨面板开关保留，且与本服务生命周期一致（完全退出窗口化即重置）。
+     */
+    val clearedIdsState = mutableStateOf<Set<String>>(emptySet())
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -320,6 +336,8 @@ class FloatingWindowService : Service(), LifecycleOwner, SavedStateRegistryOwner
                     CapturePanelOverlay(
                         uid = uid,
                         label = label,
+                        targetStartedAt = targetStartedAt,
+                        clearedIdsState = clearedIdsState,
                         onResizeDrag = { dy -> resizePanel(dy) },
                         onClose = { removePanel() }
                     )
@@ -382,6 +400,8 @@ class FloatingWindowService : Service(), LifecycleOwner, SavedStateRegistryOwner
 
     private fun removeAll() {
         markActive(false)
+        CaptureVpnService.clearWindowUidHint()
+        windowStartedAt = 0L
         pkg = ""
         uid = -1
         label = ""
@@ -410,6 +430,8 @@ class FloatingWindowService : Service(), LifecycleOwner, SavedStateRegistryOwner
 private fun CapturePanelOverlay(
     uid: Int,
     label: String,
+    targetStartedAt: Long,
+    clearedIdsState: MutableState<Set<String>>,
     onResizeDrag: (Float) -> Unit,
     onClose: () -> Unit
 ) {
@@ -428,12 +450,16 @@ private fun CapturePanelOverlay(
 
     // 被点开的记录（HttpExchange 是可变对象，靠 tick 驱动刷新）
     var detail by remember { mutableStateOf<HttpExchange?>(null) }
-    // 清屏：本轮被隐藏的记录 id（不清除底层历史）
-    var clearedIds by remember { mutableStateOf(emptySet<String>()) }
+    // 清屏：本轮被隐藏的记录 id（不清除底层历史）。状态提升到服务级，跨面板开关保留。
+    var clearedIds by clearedIdsState
     // 列表过滤词（host / path / method）
     var query by remember { mutableStateOf("") }
 
-    val scoped = remember(all, uid) { all.filter { it.uid == uid } }
+    // 精确 UID 优先；窗口期间仍未解析出 UID 的记录也保留，避免历史有请求但窗口面板为空。
+    // 这类记录在详情中明确标记为未解析 UID，不伪装成已确认的目标进程。
+    val scoped = remember(all, uid, targetStartedAt) {
+        all.filter { it.uid == uid || (it.uid < 0 && it.startTime >= targetStartedAt) }
+    }
     val rows = remember(scoped, clearedIds, query) {
         val q = query.trim()
         scoped.filter { it.id !in clearedIds && (q.isEmpty() ||
@@ -675,7 +701,11 @@ private fun PanelOverview(e: HttpExchange, label: String) {
                 HttpExchange.State.FAILED -> "失败：${e.error ?: "-"}"
             }
         )
-        PanelKV("所属进程", label.ifBlank { "UID ${e.uid}" })
+        PanelKV(
+            "所属进程",
+            if (e.uid >= 0) label.ifBlank { "UID ${e.uid}" }
+            else "${label.ifBlank { "目标进程" }}（UID 未解析）"
+        )
         PanelKV("远程地址", e.remoteIp ?: e.host, mono = true)
         PanelKV("上行 / 下行", "${formatSize(e.requestBody.size)} / ${formatSize(e.responseBody.size)}")
         PanelKV("总耗时", formatDuration(e.durationMs))

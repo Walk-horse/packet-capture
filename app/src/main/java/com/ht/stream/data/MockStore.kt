@@ -2,6 +2,7 @@ package com.ht.stream.data
 
 import android.content.Context
 import java.util.concurrent.ConcurrentHashMap
+import java.util.UUID
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -39,7 +40,7 @@ data class MockRule(
 /**
  * 接口模拟配置存储。
  *
- * - rules：桌面端下发，整体覆盖式写入
+ * - rules：桌面端下发，按 host + path 增量合并
  * - enabledApps：手机端「接口模拟」设置页逐应用开关
  * - enabled：总开关
  *
@@ -55,6 +56,12 @@ object MockStore {
     @Volatile private var cachedRules: List<MockRule>? = null
     @Volatile private var cachedApps: Set<String>? = null
     private val uidPkgCache = ConcurrentHashMap<Int, String>()
+
+    data class RuleMergeResult(
+        val total: Int,
+        val added: Int,
+        val updated: Int
+    )
 
     private fun prefs(context: Context) =
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -84,7 +91,7 @@ object MockStore {
 
     fun rulesUpdatedAt(context: Context): Long = prefs(context).getLong(KEY_UPDATED, 0L)
 
-    /** 桌面端下发：整体覆盖规则，返回写入的规则条数 */
+    /** 兼容旧调用：整体替换规则。桌面端同步请使用 [mergeRulesJson]。 */
     @Synchronized
     fun setRulesJson(context: Context, raw: String): Int {
         val list = parseRules(raw)
@@ -94,6 +101,72 @@ object MockStore {
             .apply()
         cachedRules = list
         return list.size
+    }
+
+    /**
+     * 增量合并桌面端下发的规则：host + path 相同则更新，不同则追加。
+     * method 不参与合并键，避免同一接口因请求方法差异产生重复配置。
+     */
+    @Synchronized
+    fun mergeRulesJson(context: Context, raw: String): RuleMergeResult {
+        val incoming = parseRules(raw)
+        val current = rules(context).toMutableList()
+        var added = 0
+        var updated = 0
+        incoming.forEach { rule ->
+            val index = current.indexOfFirst { sameEndpoint(it, rule) }
+            if (index >= 0) {
+                // 保留手机端已有 id，避免桌面端规则 id 变化导致详情页引用失效。
+                current[index] = rule.copy(id = current[index].id)
+                updated++
+            } else {
+                current.add(rule)
+                added++
+            }
+        }
+        persistRules(context, current)
+        return RuleMergeResult(current.size, added, updated)
+    }
+
+    /**
+     * 从抓包详情新增或更新一条接口模拟规则。
+     * 同一 method + host + path 只保留一条，避免重复点击产生重复规则。
+     */
+    @Synchronized
+    fun upsertRule(context: Context, rule: MockRule): Boolean {
+        val current = rules(context).toMutableList()
+        val index = current.indexOfFirst { sameEndpoint(it, rule) }
+        val stored = if (index >= 0) rule.copy(id = current[index].id) else rule.copy(id = UUID.randomUUID().toString())
+        if (index >= 0) current[index] = stored else current.add(stored)
+        val raw = rulesToJson(current).toString()
+        prefs(context).edit()
+            .putString(KEY_RULES, raw)
+            .putLong(KEY_UPDATED, System.currentTimeMillis())
+            .apply()
+        cachedRules = current.toList()
+        return index >= 0
+    }
+
+    /** 删除一条接口模拟规则。 */
+    @Synchronized
+    fun removeRule(context: Context, ruleId: String): Boolean {
+        val current = rules(context).toMutableList()
+        val removed = current.removeAll { it.id == ruleId }
+        if (!removed) return false
+        persistRules(context, current)
+        return true
+    }
+
+    private fun sameEndpoint(a: MockRule, b: MockRule): Boolean =
+        a.host.trim().equals(b.host.trim(), ignoreCase = true) && a.path == b.path
+
+    private fun persistRules(context: Context, rules: List<MockRule>) {
+        val raw = rulesToJson(rules).toString()
+        prefs(context).edit()
+            .putString(KEY_RULES, raw)
+            .putLong(KEY_UPDATED, System.currentTimeMillis())
+            .apply()
+        cachedRules = rules.toList()
     }
 
     private fun parseRules(raw: String): List<MockRule> {
@@ -217,9 +290,11 @@ object MockStore {
     }
 
     /** 把规则序列化回 JSON（供 GET /api/mock 回读，字段与桌面端一致） */
-    fun rulesToJson(context: Context): JSONArray {
+    fun rulesToJson(context: Context): JSONArray = rulesToJson(rules(context))
+
+    private fun rulesToJson(rules: List<MockRule>): JSONArray {
         val arr = JSONArray()
-        rules(context).forEach { r ->
+        rules.forEach { r ->
             arr.put(JSONObject().apply {
                 put("id", r.id)
                 put("enabled", r.enabled)

@@ -21,6 +21,8 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Star
@@ -53,6 +55,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import com.ht.stream.data.HttpExchange
+import com.ht.stream.data.MockRule
+import com.ht.stream.data.MockStore
 import com.ht.stream.data.RequestStore
 import java.io.File
 
@@ -261,6 +265,7 @@ private fun MessageTab(e: HttpExchange, request: Boolean, searchable: Boolean = 
     }
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
+    var headersExpanded by remember(e.id, request) { mutableStateOf(false) }
 
     val bodyFileName = remember(e) {
         "${e.host.replace(Regex("[^A-Za-z0-9._-]"), "_")}_${if (request) "req" else "resp"}"
@@ -277,10 +282,38 @@ private fun MessageTab(e: HttpExchange, request: Boolean, searchable: Boolean = 
             Column {
                 Text(startLine, fontSize = 13.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
                 Spacer(Modifier.height(8.dp))
-                headers.forEach { (k, v) ->
-                    Row {
-                        Text("$k: ", fontSize = 12.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Medium)
-                        Text(v, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clickable { headersExpanded = !headersExpanded }
+                        .padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        if (request) "请求头" else "响应头",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = StreamColors.SubText,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Text(
+                        "${headers.size}",
+                        fontSize = 12.sp,
+                        color = StreamColors.SubText
+                    )
+                    Icon(
+                        if (headersExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                        contentDescription = if (headersExpanded) "收起${if (request) "请求头" else "响应头"}" else "展开${if (request) "请求头" else "响应头"}",
+                        tint = StreamColors.SubText,
+                        modifier = Modifier.padding(start = 4.dp).size(20.dp)
+                    )
+                }
+                if (headersExpanded) {
+                    headers.forEach { (k, v) ->
+                        Row {
+                            Text("$k: ", fontSize = 12.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Medium)
+                            Text(v, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                        }
                     }
                 }
             }
@@ -293,8 +326,67 @@ private fun MessageTab(e: HttpExchange, request: Boolean, searchable: Boolean = 
             contentType = if (request) e.requestContentType else e.responseContentType,
             contentEncoding = e.headerValue(headers, "Content-Encoding"),
             searchable = searchable,
-            fileName = bodyFileName
+            fileName = bodyFileName,
+            actionSlot = if (request) {
+                {
+                    Text(
+                        "cURL",
+                        fontSize = 12.sp,
+                        color = StreamColors.Blue,
+                        modifier = Modifier
+                            .clickable {
+                                clipboard.setText(AnnotatedString(buildCurl(e)))
+                                Toast.makeText(context, "cURL 已复制", Toast.LENGTH_SHORT).show()
+                            }
+                            .padding(horizontal = 4.dp)
+                    )
+                    Text(
+                        "设为模拟",
+                        fontSize = 12.sp,
+                        color = StreamColors.Blue,
+                        modifier = Modifier
+                            .clickable {
+                                val replaced = saveAsMockRule(context, e)
+                                Toast.makeText(
+                                    context,
+                                    if (replaced) "已更新接口模拟规则" else "已添加接口模拟规则",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                            .padding(horizontal = 4.dp)
+                    )
+                }
+            } else null
         )
     }
 }
 
+/** 按桌面端「从抓包生成规则」口径，把当前记录保存为手机端接口模拟规则。 */
+private fun saveAsMockRule(context: android.content.Context, e: HttpExchange): Boolean {
+    val responseType = e.responseContentType?.trim().takeUnless { it.isNullOrEmpty() }
+        ?: e.requestContentType?.trim().takeUnless { it.isNullOrEmpty() }
+        ?: "application/json"
+    val responseBody = run {
+        val encoding = e.headerValue(e.responseHeaders, "Content-Encoding")
+        val decoded = decompressBody(encoding, e.responseBody)
+        if (decoded == null || decoded.size > 256 * 1024) ""
+        else bodyToText(decoded, responseType) ?: ""
+    }
+    val rule = MockRule(
+        id = "",
+        enabled = true,
+        name = "${e.method.ifEmpty { "*" }} ${e.path.ifEmpty { "/" }}",
+        method = e.method.ifEmpty { "*" },
+        host = e.host,
+        path = e.path.substringBefore('?').ifEmpty { "/" },
+        statusCode = e.statusCode.takeIf { it in 100..599 } ?: 200,
+        contentType = responseType,
+        body = responseBody
+    )
+    val replaced = MockStore.upsertRule(context, rule)
+    MockStore.packageOfUid(context, e.uid)?.let { pkg ->
+        MockStore.setAppEnabled(context, pkg, true)
+        MockStore.setEnabled(context, true)
+    }
+    return replaced
+}

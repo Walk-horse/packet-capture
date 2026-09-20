@@ -25,6 +25,7 @@ class TcpSession(
     private val remotePort: Int,
     private val proxyPort: Int,
     private val uid: Int,              // 发起连接的应用 uid（-1 未知）
+    private val resolveUid: () -> Int = { uid },
     private val writeToTun: (ByteArray) -> Unit,
     private val onClose: (String) -> Unit
 ) {
@@ -44,6 +45,8 @@ class TcpSession(
 
     private var proxySocket: Socket? = null
     private var proxyOut: OutputStream? = null
+    @Volatile private var proxyReady = false
+    @Volatile private var resolvedUid = uid
 
     /** 处理来自 App（TUN 方向）的 TCP 段 */
     fun onAppSegment(ip: Packet.IpHeader, tcp: Packet.TcpSegment, packet: ByteArray) {
@@ -67,6 +70,7 @@ class TcpSession(
             when {
                 tcp.seq == appNext -> {
                     try {
+                        ensureProxyReady()
                         proxyOut?.write(packet, tcp.payloadOffset, tcp.payloadLen)
                         proxyOut?.flush()
                         appNext += tcp.payloadLen
@@ -85,7 +89,10 @@ class TcpSession(
                 appFin = true
                 appNext += 1
                 sendToApp(tcp, 0L, Packet.TCP_ACK)
-                try { proxySocket?.shutdownOutput() } catch (_: Exception) {}
+                try {
+                    ensureProxyReady()
+                    proxySocket?.shutdownOutput()
+                } catch (_: Exception) {}
                 maybeSendFin()
             } else {
                 sendToApp(tcp, 0L, Packet.TCP_ACK)
@@ -113,21 +120,36 @@ class TcpSession(
             socket.tcpNoDelay = true
             socket.keepAlive = true
             socket.connect(InetSocketAddress("127.0.0.1", proxyPort), 5000)
-            // 把原始目标告知代理
-            val prelude = PROXY_DEST_LINE.format(Packet.ipToString(remoteIp), remotePort, uid)
-                .toByteArray(Charsets.US_ASCII)
-            socket.getOutputStream().write(prelude)
-            socket.getOutputStream().flush()
             proxySocket = socket
             proxyOut = socket.getOutputStream()
             sendSynAck(tcp)
             Log.d(TAG, "[$key] SYN-ACK sent, proxy connected")
-            startProxyReader(socket.getInputStream())
         } catch (e: Exception) {
             Log.w(TAG, "[$key] connect proxy failed: ${e.message}")
             try { socket.close() } catch (_: Exception) {}
             close()
         }
+    }
+
+    /**
+     * 首个业务数据到达后再发送代理前导行。
+     * Android 10+ 在 TCP SYN 刚出现时经常还查不到 socket owner UID，
+     * 延迟到 ClientHello/HTTP 首包时重试，避免整条请求固定为 uid=-1。
+     */
+    @Synchronized
+    private fun ensureProxyReady() {
+        if (proxyReady) return
+        val socket = proxySocket ?: throw IOException("proxy socket unavailable")
+        val detected = runCatching { resolveUid() }.getOrDefault(-1)
+        if (detected >= 0) resolvedUid = detected
+        val prelude = PROXY_DEST_LINE.format(
+            Packet.ipToString(remoteIp), remotePort, resolvedUid
+        ).toByteArray(Charsets.US_ASCII)
+        socket.getOutputStream().write(prelude)
+        socket.getOutputStream().flush()
+        proxyReady = true
+        startProxyReader(socket.getInputStream())
+        Log.d(TAG, "[$key] proxy ready uid=$resolvedUid")
     }
 
     private fun sendSynAck(tcp: Packet.TcpSegment) {

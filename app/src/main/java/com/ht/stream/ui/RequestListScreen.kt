@@ -81,13 +81,13 @@ import com.ht.stream.data.RequestStore
 import com.ht.stream.capture.CaptureVpnService
 import com.ht.stream.Screen
 
-/** 二级页类型：域名明细 / 进程明细 / 透传域名明细 */
+/** 二级页类型：域名明细 / 应用明细 / 透传域名明细 */
 private sealed interface Sub {
     /** 按域名 tab：某域名下的各次请求 */
     data class Domain(val host: String) : Sub
 
-    /** 按进程 tab：某进程（uid）发出的各次请求 */
-    data class Process(val uid: Int) : Sub
+    /** 按应用 tab：某应用（uid）发出的各次请求 */
+    data class App(val uid: Int) : Sub
 
     /** 透传 tab：某域名下的未解密连接明细 */
     data class PassHost(val host: String) : Sub
@@ -102,14 +102,19 @@ fun RequestListScreen(
 ) {
     val all by RequestStore.exchanges.collectAsState()
     RequestStore.tick.collectAsState()
+    val filterScope = sessionId ?: "all"
+    val savedFilter = remember(filterScope) { RequestListUiState.filter(filterScope) }
     var tab by remember { mutableIntStateOf(0) }
-    var searchOn by remember { mutableStateOf(false) }
-    var filter by remember { mutableStateOf("") }
+    var searchOn by remember(filterScope) { mutableStateOf(savedFilter.searchOn) }
+    var filter by remember(filterScope) { mutableStateOf(savedFilter.text) }
     // 资源类型筛选（全部 / Fetch·XHR / 文档 / CSS / JS / 图片 / Wasm / 其他）
-    var typeSel by remember { mutableStateOf(ReqType.ALL) }
-    // 当前二级页（域名 / 进程 / 透传域名），null 表示主 tabs 区
+    var typeSel by remember(filterScope) { mutableStateOf(savedFilter.type) }
+    // 当前二级页（域名 / 应用 / 透传域名），null 表示主 tabs 区
     var sub by remember { mutableStateOf<Sub?>(null) }
     val listState = rememberLazyListState()
+    LaunchedEffect(filterScope, searchOn, filter, typeSel) {
+        RequestListUiState.save(filterScope, FilterState(searchOn, filter, typeSel))
+    }
     // 切换 tab / 切换类型筛选 / 进入或退出二级页时回到顶部
     LaunchedEffect(tab, typeSel, sub) { listState.scrollToItem(0) }
     val ctx = LocalContext.current
@@ -140,14 +145,14 @@ fun RequestListScreen(
         StreamTopBar(
             title = when (cur) {
                 is Sub.Domain -> cur.host
-                is Sub.Process -> appInfo.info(cur.uid).label
+                is Sub.App -> appInfo.info(cur.uid).label
                 is Sub.PassHost -> cur.host
                 null -> "全部请求"
             },
             onBack = { if (cur != null) sub = null else onBack() },
             backLabel = when (cur) {
                 is Sub.Domain -> "按域名"
-                is Sub.Process -> "按进程"
+                is Sub.App -> "按应用"
                 is Sub.PassHost -> "透传"
                 null -> if (sessionId == null) "总览" else "抓包历史"
             },
@@ -174,11 +179,11 @@ fun RequestListScreen(
                 }
                 ExchangeDetailList(rows, "该域名暂无请求", listState, onOpen, typeSel, { typeSel = it })
             }
-            is Sub.Process -> {
+            is Sub.App -> {
                 val rows = remember(base, cur, typeSel) {
                     base.filter { it.uid == cur.uid && (typeSel == ReqType.ALL || classifyType(it) == typeSel) }
                 }
-                ExchangeDetailList(rows, "该进程暂无请求", listState, onOpen, typeSel, { typeSel = it })
+                ExchangeDetailList(rows, "该应用暂无请求", listState, onOpen, typeSel, { typeSel = it })
             }
             is Sub.PassHost -> {
                 val rows = remember(basePass, cur) { basePass.filter { it.host == cur.host } }
@@ -234,7 +239,7 @@ fun RequestListScreen(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     CompactTabs(
-                        items = listOf("全部请求", "按域名", "按进程", "透传"),
+                        items = listOf("全部请求", "按域名", "按应用", "透传"),
                         selected = tab,
                         onSelect = { tab = it }
                     )
@@ -243,7 +248,7 @@ fun RequestListScreen(
                 Text(
                     when (tab) {
                         1 -> "共 ${filtered.groupBy { it.host }.size} 个域名 · ${filtered.size} 个请求"
-                        2 -> "共 ${filtered.groupBy { it.uid }.size} 个进程 · ${filtered.size} 个请求"
+                        2 -> "共 ${filtered.groupBy { it.uid }.size} 个应用 · ${filtered.size} 个请求"
                         3 -> "共 ${filteredPass.groupBy { it.host }.size} 个域名 · ${filteredPass.size} 条连接"
                         else -> "共 ${filtered.size} 个请求"
                     },
@@ -286,19 +291,19 @@ fun RequestListScreen(
                             }
                         }
                         2 -> {
-                            // 按进程：进程（uid）聚合 → 二级为该进程的请求明细
+                            // 按应用：应用（uid）聚合 → 二级为该应用的请求明细
                             if (filtered.isEmpty()) {
                                 item { EmptyHint("暂无请求") }
                             } else {
-                                val procs = filtered.groupBy { it.uid }.toList()
+                                val apps = filtered.groupBy { it.uid }.toList()
                                     .sortedByDescending { it.second.size }
-                                items(procs, key = { "proc_${it.first}" }) { (uid, list) ->
+                                items(apps, key = { "app_${it.first}" }) { (uid, list) ->
                                     val info = appInfo.info(uid)
-                                    ProcessRow(
+                                    AppRow(
                                         info = info,
                                         count = list.size,
                                         downBytes = list.sumOf { it.responseBody.size.toLong() },
-                                        onClick = { sub = Sub.Process(uid) }
+                                        onClick = { sub = Sub.App(uid) }
                                     )
                                 }
                             }
@@ -336,7 +341,7 @@ fun RequestListScreen(
     }
 }
 
-/** 请求明细列表（域名/进程二级页共用）：顶部计数 + 类型筛选（可选） + 请求行 */
+/** 请求明细列表（域名/应用二级页共用）：顶部计数 + 类型筛选（可选） + 请求行 */
 @Composable
 private fun ExchangeDetailList(
     rows: List<HttpExchange>,
@@ -447,8 +452,8 @@ private class AppInfoResolver(private val ctx: Context) {
 
     fun info(uid: Int): AppInfo {
         cache.get(uid)?.let { return it }
-        // uid < 10000 是系统进程（android/system、systemui 等共享 uid 1000），
-        // 用 getPackagesForUid 会随机命中某个系统包名，反而误导，故直接标为系统进程。
+        // uid < 10000 是系统 UID（android/system、systemui 等共享 uid 1000），
+        // 这里不强行映射成某个应用名称，避免把共享 UID 误标给单个包。
         // 先拿包名（getPackagesForUid 已按可见性过滤）；再取 ApplicationInfo。
         // 两步分开：Android 11+ 包可见性可能让 getApplicationInfo 抛 NameNotFoundException，
         // 但此时包名仍有价值，故回退为显示包名而不是 "UID xxx"。
@@ -460,8 +465,8 @@ private class AppInfoResolver(private val ctx: Context) {
             app != null -> app.loadLabel(pm).toString()
             pkg != null -> pkg
             uid == 0 -> "Root"
-            uid < 0 -> "未知进程"
-            uid < 10000 -> "系统进程 (uid $uid)"
+            uid < 0 -> "未知应用"
+            uid < 10000 -> "系统应用 (uid $uid)"
             else -> "UID $uid"
         }
         val icon = try {
@@ -490,9 +495,9 @@ private fun drawableToBitmap(d: Drawable, size: Int): Bitmap {
     return bmp
 }
 
-/** 进程聚合行（按进程 tab）：应用图标 + 名称 + 请求数/下行，点击进入该进程请求明细 */
+/** 应用聚合行（按应用 tab）：应用图标 + 名称 + 请求数/下行，点击进入该应用请求明细 */
 @Composable
-private fun ProcessRow(
+private fun AppRow(
     info: AppInfoResolver.AppInfo,
     count: Int,
     downBytes: Long,
@@ -753,6 +758,7 @@ fun CaptureScreen(
     nav: (Screen) -> Unit
 ) {
     val startedAt by CaptureVpnService.startedAt.collectAsState()
+    val savedFilter = remember { CaptureUiState.filter() }
     var nowTick by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(running) {
         while (true) {
@@ -763,27 +769,39 @@ fun CaptureScreen(
     val all by RequestStore.exchanges.collectAsState()
     RequestStore.tick.collectAsState()
     var tab by remember { mutableIntStateOf(0) }
-    var filter by remember { mutableStateOf("") }
-    var typeSel by remember { mutableStateOf(ReqType.ALL) }
-    var filterOpen by remember { mutableStateOf(false) }
+    var filter by remember { mutableStateOf(savedFilter.text) }
+    var typeSel by remember { mutableStateOf(savedFilter.type) }
+    var filterOpen by remember { mutableStateOf(savedFilter.searchOn) }
     var sub by remember { mutableStateOf<Sub?>(null) }
     var showEndDialog by remember { mutableStateOf(false) }
+    LaunchedEffect(filter, typeSel, filterOpen) {
+        CaptureUiState.saveFilter(FilterState(filterOpen, filter, typeSel))
+    }
     // 进入抓包页即视为新抓包会话：隐藏进入前已有的记录，列表初始为空
-    var clearedIds by remember { mutableStateOf(RequestStore.exchanges.value.map { it.id }.toSet()) }
     val listState = rememberLazyListState()
     LaunchedEffect(tab, typeSel, sub) { listState.scrollToItem(0) }
+    // 进入抓包页时隐藏历史快照：提升到单例，避免导航到详情再返回导致重组重置、列表被清空
+    CaptureUiState.ensureSnapshot()
     val ctx = LocalContext.current
     val appInfo = remember(ctx) { AppInfoResolver(ctx.applicationContext) }
     val onOpen: (HttpExchange) -> Unit = { nav(Screen.Detail(it.id)) }
 
     val handleBack: () -> Unit = {
-        if (running) showEndDialog = true else onBack()
+        // 处于二级明细页（按域名/透传）时，返回到对应列表页，而不是直接回到总览（与「全部请求」页一致）
+        if (sub != null) {
+            sub = null
+        } else if (running) {
+            showEndDialog = true
+        } else {
+            onBack()
+        }
     }
     BackHandler(enabled = true) { handleBack() }
 
     val base = all
     // 当前会话可见记录（进入页面时之前的历史被隐藏）
-    val visible = remember(base, clearedIds) { base.filter { it.id !in clearedIds } }
+    val cleared = CaptureUiState.clearedIds.value
+    val visible = remember(base, cleared) { base.filter { it.id !in cleared } }
     // 过滤条件仅作用于「全部请求」tab
     val filtered = remember(visible, filter, typeSel) {
         visible.filter { e ->
@@ -804,6 +822,7 @@ fun CaptureScreen(
     val up = RequestStore.uploadBytes.get()
     val down = RequestStore.downloadBytes.get()
     val elapsedText = if (running && startedAt > 0) formatCaptureElapsed(nowTick - startedAt) else null
+    val detail = sub != null
 
     Column(Modifier.fillMaxSize().background(StreamColors.BgGray)) {
         StreamTopBar(
@@ -811,8 +830,10 @@ fun CaptureScreen(
             onBack = handleBack,
             backLabel = "总览",
             actions = {
-                IconButton(onClick = { clearedIds = all.map { it.id }.toSet() }) {
-                    Icon(Icons.Filled.Delete, contentDescription = "清除", tint = Color.White)
+                if (!detail) {
+                    IconButton(onClick = { CaptureUiState.clearedIds.value = all.map { it.id }.toSet() }) {
+                        Icon(Icons.Filled.Delete, contentDescription = "清除", tint = Color.White)
+                    }
                 }
             }
         )
@@ -868,11 +889,11 @@ fun CaptureScreen(
                 }
                 ExchangeDetailList(rows, "该域名暂无请求", listState, onOpen, typeSel, { typeSel = it })
             }
-            is Sub.Process -> {
+            is Sub.App -> {
                 val rows = remember(base, cur, typeSel) {
                     base.filter { it.uid == cur.uid && (typeSel == ReqType.ALL || classifyType(it) == typeSel) }
                 }
-                ExchangeDetailList(rows, "该进程暂无请求", listState, onOpen, typeSel, { typeSel = it })
+                ExchangeDetailList(rows, "该应用暂无请求", listState, onOpen, typeSel, { typeSel = it })
             }
             is Sub.PassHost -> {
                 val rows = remember(basePass, cur) { basePass.filter { it.host == cur.host } }
@@ -884,7 +905,7 @@ fun CaptureScreen(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     CompactTabs(
-                        items = listOf("全部请求", "按域名", "透传"),
+                        items = listOf("全部请求", "按域名", "按应用", "透传"),
                         selected = tab,
                         onSelect = {
                             tab = it
@@ -903,7 +924,8 @@ fun CaptureScreen(
                     Text(
                         when (tab) {
                             1 -> "共 ${visible.groupBy { it.host }.size} 个域名 · ${visible.size} 个请求"
-                            2 -> "共 ${basePass.size} 条未解密连接"
+                            2 -> "共 ${visible.groupBy { it.uid }.size} 个应用 · ${visible.size} 个请求"
+                            3 -> "共 ${basePass.size} 条未解密连接"
                             else -> "共 ${filtered.size} 个请求"
                         },
                         fontSize = 12.sp,
@@ -976,7 +998,7 @@ fun CaptureScreen(
                         0 -> {
                             // 全部请求：平铺（应用过滤条件）
                             if (filtered.isEmpty()) {
-                                item { EmptyHint(captureEmptyText(all, clearedIds)) }
+                                item { EmptyHint(captureEmptyText(all, CaptureUiState.clearedIds.value)) }
                             } else {
                                 items(filtered, key = { it.id }) { e ->
                                     ExchangeRow(e) { onOpen(e) }
@@ -986,7 +1008,7 @@ fun CaptureScreen(
                         1 -> {
                             // 按域名：域名聚合 → 二级为请求明细（不受过滤条件影响）
                             if (visible.isEmpty()) {
-                                item { EmptyHint(captureEmptyText(all, clearedIds)) }
+                                item { EmptyHint(captureEmptyText(all, CaptureUiState.clearedIds.value)) }
                             } else {
                                 val hosts = visible.groupBy { it.host }.toList()
                                     .sortedByDescending { it.second.size }
@@ -996,6 +1018,24 @@ fun CaptureScreen(
                                         count = list.size,
                                         downBytes = list.sumOf { it.responseBody.size.toLong() },
                                         onClick = { sub = Sub.Domain(h) }
+                                    )
+                                }
+                            }
+                        }
+                        2 -> {
+                            // 按应用：应用（uid）聚合 → 二级为该应用的请求明细
+                            if (visible.isEmpty()) {
+                                item { EmptyHint(captureEmptyText(all, CaptureUiState.clearedIds.value)) }
+                            } else {
+                                val apps = visible.groupBy { it.uid }.toList()
+                                    .sortedByDescending { it.second.size }
+                                items(apps, key = { "capture_app_${it.first}" }) { (uid, list) ->
+                                    val info = appInfo.info(uid)
+                                    AppRow(
+                                        info = info,
+                                        count = list.size,
+                                        downBytes = list.sumOf { it.responseBody.size.toLong() },
+                                        onClick = { sub = Sub.App(uid) }
                                     )
                                 }
                             }
@@ -1067,4 +1107,51 @@ private fun formatCaptureElapsed(ms: Long): String {
 private fun captureEmptyText(all: List<HttpExchange>, clearedIds: Set<String>): String {
     val hasHiddenHistory = all.any { it.id in clearedIds }
     return if (hasHiddenHistory) "抓包历史已保留，本次新记录将显示在此" else "暂无请求"
+}
+
+/**
+ * 抓包页跨组合持久的 UI 状态。
+ * 根因：MainActivity 用栈式 Screen 导航，进入详情页时 CaptureScreen 会被移出组合树，
+ * 返回时重新组合，页面级 remember 全部重置。原 clearedIds 用 remember 保存，
+ * 重置后变成「当前全部记录 id」，导致 visible 过滤后列表清空。
+ * 故把 clearedIds 提升到此处单例，仅首次进入抓包页时拍一次快照，后续返回不再重置。
+ */
+private object CaptureUiState {
+    val clearedIds = mutableStateOf<Set<String>>(emptySet())
+    private var savedFilter = FilterState()
+    private var snapshotTaken = false
+
+    @Synchronized
+    fun filter(): FilterState = savedFilter
+
+    @Synchronized
+    fun saveFilter(state: FilterState) {
+        savedFilter = state
+    }
+
+    /** 进入抓包页时调用一次：把当时已有记录标记为「历史」隐藏，仅展示之后新抓到的 */
+    fun ensureSnapshot() {
+        if (!snapshotTaken) {
+            clearedIds.value = RequestStore.exchanges.value.map { it.id }.toSet()
+            snapshotTaken = true
+        }
+    }
+}
+
+private data class FilterState(
+    val searchOn: Boolean = false,
+    val text: String = "",
+    val type: ReqType = ReqType.ALL
+)
+
+private object RequestListUiState {
+    private val filters = mutableMapOf<String, FilterState>()
+
+    @Synchronized
+    fun filter(scope: String): FilterState = filters[scope] ?: FilterState()
+
+    @Synchronized
+    fun save(scope: String, state: FilterState) {
+        filters[scope] = state
+    }
 }
